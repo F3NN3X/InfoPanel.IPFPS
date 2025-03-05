@@ -44,7 +44,7 @@
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       <TargetPath>PresentMon\PresentMonService.exe</TargetPath>
     </None>
-        <None Update="PluginInfo.ini">
+    <None Update="PluginInfo.ini">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       <TargetPath>PluginInfo.ini</TargetPath>
     </None>
