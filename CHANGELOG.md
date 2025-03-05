@@ -67,7 +67,7 @@ All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documen
 - ETW session leaks (e.g., `PresentMon_15a132264c0649a59270077c6dd9a2bb`) on shutdown.
 
 - **Purpose**:
-- Established a working plugin for DXGI apps (e.g., Arma Reforger), capturing ~140-175 FPS with clean startup/shutdown.
+- Established a working plugin for DXGI apps (e.g., game), capturing ~140-175 FPS with clean startup/shutdown.
 
 ## [1.0.7 and Earlier] - Pre-2025-03-04
 
@@ -87,4 +87,4 @@ All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documen
 - Incorrect FPS calculations (no averaging).
 
 - **Purpose**:
-- Proof of concept to integrate PresentMon with InfoPanel, focusing on Arma Reforger as a test case.
+- Proof of concept to integrate PresentMon with InfoPanel.
