@@ -4,7 +4,21 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-	<Platforms>x64</Platforms>
+    <Platforms>x64</Platforms>
+    <!-- Ensure all referenced assemblies are copied to the output directory -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Disable generation of deps.json -->
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <!-- Disable generation of PDB files in Release builds -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <!-- Limit satellite resources to English only -->
+    <SatelliteResourceLanguages>en-US</SatelliteResourceLanguages>
+    <!-- Define the plugin version -->
+    <Version>1.1.0</Version>
+    <!-- Customize output path for Release builds -->
+    <OutputPath Condition="'$(Configuration)' == 'Release'">bin\Release\net8.0-windows\InfoPanel.IPFPS-v$(Version)</OutputPath>
+    <!-- Prevent appending TargetFramework to OutputPath -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,28 +27,26 @@
     <PackageReference Include="Vanara.PInvoke.User32" Version="4.0.6" />
   </ItemGroup>
 
-	<ItemGroup>
-		<ProjectReference Include="D:\gitProjects\infopanel\InfoPanel.Plugins\InfoPanel.Plugins.csproj">
-			<Private>false</Private>
-			<ExcludeAssets>runtime</ExcludeAssets>
-		</ProjectReference>
-	</ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="D:\gitProjects\infopanel\InfoPanel.Plugins\InfoPanel.Plugins.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
 
   <ItemGroup>
-    <None Update="PresentMon-1.9.2-x64.exe">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Update="PresentMonAPI.h">
+    <!-- Copy PresentMon files to a PresentMon subdirectory in the output -->
+    <None Update="PresentMon-2.3.0-x64.exe">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>PresentMon\PresentMon-2.3.0-x64.exe</TargetPath>
     </None>
-    <None Update="PresentMonAPI2.dll">
+    <None Update="PresentMonService.exe">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>PresentMon\PresentMonService.exe</TargetPath>
     </None>
-    <None Update="PresentMonDataProvider.cfg">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Update="PresentMonDataProvider.exe">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <None Update="PluginInfo.ini">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>PluginInfo.ini</TargetPath>
     </None>
   </ItemGroup>
 
