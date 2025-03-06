@@ -11,71 +11,66 @@ using Vanara.PInvoke;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.1.0
+ * Version: 1.2.0
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen applications using PresentMon. Detects fullscreen processes, launches PresentMon to capture performance data, and updates sensors every second. Includes robust cleanup of PresentMon processes and ETW sessions on app exit or InfoPanel shutdown.
  * Changelog:
+ *   - v1.2.0 (Mar 7, 2025): Fixed FPS hang with ReShade, prevented restarts, ensured full cleanup.
+ *     - **Changes**: Enhanced `ProcessExists` with window check, added 10s cleanup timeout, ensured PresentMon terminates, added ReShade detection, prevented restarts by filtering InfoPanel PID and non-game apps, improved cleanup with retries and verification.
+ *     - **Purpose**: Resolve hangs with ReShade, stop unwanted restarts, ensure all processes and ETW sessions terminate.
  *   - v1.1.0 (Mar 5, 2025): Finalized robust cleanup and fullscreen detection.
- *     - **Changes**: Consolidated cleanup to `StartCaptureAsync`, added `ProcessExists` with `HasExited` check, removed redundant monitoring loop cleanup. Left `ArgumentException` in logs as debug artifact.
- *     - **Purpose**: Ensures reliable shutdown of PresentMon and service, cleaner logs, and stable FPS tracking (~140-175 FPS in Arma Reforger).
- *   - v1.0.9 (Mar 5, 2025): Improved process detection and exception handling.
- *     - **Changes**: Added `proc != null && !proc.HasExited` to `ProcessExists`, moved cleanup logic to `StartCaptureAsync`, enhanced logging in `GetActiveFullscreenProcessId`.
- *     - **Purpose**: Fix stalled cleanup when Arma exits, reduce redundant checks, improve debug visibility.
- *   - v1.0.8 (Mar 4, 2025): Initial stable release with service management.
- *     - **Changes**: Introduced `StartPresentMonService` and `StopPresentMonService` for ETW session handling, fixed PresentMon termination with `--terminate_on_proc_exit`.
- *     - **Purpose**: Enable FPS capture for DXGI apps, ensure ETW sessions don’t linger.
- *   - Earlier versions: Prototypes with basic fullscreen detection and FPS parsing.
- *     - **Purpose**: Proof of concept for PresentMon integration.
- * Note: Requires PresentMon-2.3.0-x64.exe and PresentMonService.exe in the plugin subdirectory 'PresentMon'. Admin rights needed for service management.
+ *     - **Changes**: Consolidated cleanup to `StartCaptureAsync`, added `ProcessExists` with `HasExited` check, removed redundant monitoring loop cleanup.
+ *     - **Purpose**: Ensures reliable shutdown of PresentMon and service, cleaner logs, stable FPS (~140-175 FPS in Arma Reforger).
+ * Note: Requires PresentMon-2.3.0-x64.exe and PresentMonService.exe in 'PresentMon' subdirectory. Admin rights needed for service management.
  */
 
 namespace InfoPanel.IPFPS
 {
     public class IPFpsPlugin : BasePlugin, IDisposable
     {
-        // Sensors for displaying FPS and frame time in the UI
         private readonly PluginSensor _fpsSensor = new("fps", "Frames Per Second", 0, "FPS");
         private readonly PluginSensor _frameTimeSensor = new("frame time", "Frame Time", 0, "ms");
 
-        // PresentMon process instance and state tracking
         private Process? _presentMonProcess;
-        private CancellationTokenSource? _cts; // For cancelling async tasks
-        private uint _currentPid; // Tracks the current fullscreen app PID
-        private volatile bool _isMonitoring; // Indicates if PresentMon is active
-        private float _frameTimeSum = 0; // Sums frame times for averaging
-        private int _frameCount = 0; // Counts frames for smoothing
-        private const int SmoothWindow = 5; // Number of frames to average over
-        private const string ServiceName = "InfoPanelPresentMonService"; // Service name for ETW
-        private string? _currentSessionName; // Unique ETW session name
-        private bool _serviceRunning = false; // Tracks service state
+        private CancellationTokenSource? _cts;
+        private Task? _monitoringTask;
+        private uint _currentPid;
+        private volatile bool _isMonitoring;
+        private float _frameTimeSum = 0;
+        private int _frameCount = 0;
+        private const int SmoothWindow = 5;
+        private const string ServiceName = "InfoPanelPresentMonService";
+        private string? _currentSessionName;
+        private bool _serviceRunning = false;
+        private readonly int _infoPanelPid; // Store InfoPanel's PID to exclude it
 
-        // Executable names for PresentMon and its service
         private static readonly string PresentMonAppName = "PresentMon-2.3.0-x64";
         private static readonly string PresentMonServiceAppName = "PresentMonService";
 
-        // Constructor with plugin metadata
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.1.0")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.0")
         {
             _presentMonProcess = null;
             _cts = null;
+            _monitoringTask = null;
+            _infoPanelPid = Process.GetCurrentProcess().Id; // Capture InfoPanel's PID
         }
 
-        public override string? ConfigFilePath => null; // No config file needed
-        public override TimeSpan UpdateInterval => TimeSpan.FromSeconds(1); // Update every second
+        public override string? ConfigFilePath => null;
+        public override TimeSpan UpdateInterval => TimeSpan.FromSeconds(1);
 
-        // Initialize the plugin by cleaning up leftovers and starting the monitoring loop
         public override void Initialize()
         {
-            TerminateExistingPresentMonProcesses(); // Kill any stray PresentMon instances
-            ClearETWSessions(); // Remove lingering ETW sessions
-            _cts = new CancellationTokenSource(); // Create cancellation token
-            _ = Task.Run(() => StartMonitoringLoopAsync(_cts.Token)); // Start async monitoring
+            Console.WriteLine("Initializing IPFpsPlugin...");
+            TerminateExistingPresentMonProcesses();
+            ClearETWSessions();
+            _cts = new CancellationTokenSource();
+            _monitoringTask = Task.Run(() => StartMonitoringLoopAsync(_cts.Token));
+            Console.WriteLine("Monitoring task started.");
         }
 
-        // Start the PresentMon service for ETW session management from the PresentMon subdirectory
         private void StartPresentMonService()
         {
-            if (_serviceRunning) return; // Skip if already running
+            if (_serviceRunning) return;
 
             string? pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             if (string.IsNullOrEmpty(pluginDir))
@@ -84,7 +79,6 @@ namespace InfoPanel.IPFPS
                 return;
             }
 
-            // Look for PresentMonService.exe in the PresentMon subdirectory
             string presentMonDir = Path.Combine(pluginDir, "PresentMon");
             string servicePath = Path.Combine(presentMonDir, $"{PresentMonServiceAppName}.exe");
             if (!File.Exists(servicePath))
@@ -95,7 +89,6 @@ namespace InfoPanel.IPFPS
 
             try
             {
-                // Stop and delete any existing service instance
                 ExecuteCommand("sc.exe", $"stop {ServiceName}", 5000, false);
                 ExecuteCommand("sc.exe", $"delete {ServiceName}", 5000, false);
 
@@ -105,8 +98,9 @@ namespace InfoPanel.IPFPS
                 Console.WriteLine($"Starting {ServiceName}...");
                 ExecuteCommand("sc.exe", $"start {ServiceName}", 5000, true);
 
-                Thread.Sleep(1000); // Give service time to start
+                Thread.Sleep(1000); // To be async later
                 _serviceRunning = true;
+                Console.WriteLine($"{ServiceName} started successfully.");
             }
             catch (Exception ex)
             {
@@ -114,20 +108,20 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        // Stop and remove the PresentMon service
         private void StopPresentMonService()
         {
-            if (!_serviceRunning) return; // Skip if not running
+            if (!_serviceRunning) return;
 
             try
             {
                 Console.WriteLine($"Stopping {ServiceName}...");
-                ExecuteCommand("sc.exe", $"stop {ServiceName}", 15000, true); // Long timeout for graceful stop
+                ExecuteCommand("sc.exe", $"stop {ServiceName}", 15000, true);
                 Console.WriteLine($"Waiting for {ServiceName} to stop...");
-                Thread.Sleep(2000); // Wait for stop to complete
+                Thread.Sleep(2000); // To be async later
                 ExecuteCommand("sc.exe", $"delete {ServiceName}", 5000, true);
                 _serviceRunning = false;
                 Console.WriteLine($"{ServiceName} stopped and deleted.");
+                TerminateExistingPresentMonProcesses(); // Ensure stragglers are killed
             }
             catch (Exception ex)
             {
@@ -135,7 +129,6 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        // Clear any existing PresentMon ETW sessions
         private void ClearETWSessions()
         {
             try
@@ -163,10 +156,11 @@ namespace InfoPanel.IPFPS
                         {
                             string sessionName = line.Trim().Split(' ')[0];
                             Console.WriteLine($"Found ETW session: {sessionName}, stopping...");
-                            ExecuteCommand("logman.exe", $"stop {sessionName} -ets", 1000, false);
+                            ExecuteCommand("logman.exe", $"stop {sessionName} -ets", 1000, true); // Log output
                         }
                     }
                 }
+                Console.WriteLine("ETW session cleanup completed.");
             }
             catch (Exception ex)
             {
@@ -174,24 +168,24 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        // Main monitoring loop to detect fullscreen apps and start capture
         private async Task StartMonitoringLoopAsync(CancellationToken cancellationToken)
         {
             try
             {
+                Console.WriteLine("Starting monitoring loop...");
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    uint pid = GetActiveFullscreenProcessId(); // Check for fullscreen app
+                    uint pid = GetActiveFullscreenProcessId();
                     Console.WriteLine($"Checked for fullscreen PID: {pid}");
 
-                    if (pid != 0 && pid != _currentPid && !_isMonitoring) // New fullscreen app detected
+                    if (pid != 0 && pid != _currentPid && !_isMonitoring)
                     {
                         _currentPid = pid;
-                        StartPresentMonService(); // Start ETW service
-                        await StartCaptureAsync(pid, cancellationToken); // Launch PresentMon
+                        StartPresentMonService();
+                        await StartCaptureAsync(pid, cancellationToken);
                     }
 
-                    await Task.Delay(1000, cancellationToken); // Check every second
+                    await Task.Delay(1000, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
@@ -202,14 +196,17 @@ namespace InfoPanel.IPFPS
             {
                 Console.WriteLine($"Monitoring loop error: {ex}");
             }
+            finally
+            {
+                Console.WriteLine("Monitoring loop exited.");
+            }
         }
 
-        // Launch PresentMon to capture FPS data for the given PID
         private async Task StartCaptureAsync(uint pid, CancellationToken cancellationToken)
         {
-            if (_presentMonProcess != null) StopCapture(); // Stop any existing instance
+            if (_presentMonProcess != null) StopCapture();
 
-            _currentSessionName = $"PresentMon_{Guid.NewGuid():N}"; // Unique session name
+            _currentSessionName = $"PresentMon_{Guid.NewGuid():N}";
             string arguments = $"--process_id {pid} --output_stdout --terminate_on_proc_exit --stop_existing_session --session_name {_currentSessionName}";
             ProcessStartInfo? startInfo = GetServiceStartInfo(arguments);
             if (startInfo == null)
@@ -218,9 +215,10 @@ namespace InfoPanel.IPFPS
                 return;
             }
 
+            DateTime startTime = DateTime.Now;
             using (_presentMonProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true })
             {
-                _presentMonProcess.Exited += (s, e) => // Handle PresentMon exit
+                _presentMonProcess.Exited += (s, e) =>
                 {
                     Console.WriteLine($"PresentMon exited with code: {_presentMonProcess?.ExitCode ?? -1}");
                     _isMonitoring = false;
@@ -229,14 +227,15 @@ namespace InfoPanel.IPFPS
                 try
                 {
                     Console.WriteLine($"Starting PresentMon with args: {arguments}");
+                    if (IsReShadeActive(pid))
+                        Console.WriteLine("Warning: ReShade detected, potential interference with PresentMon.");
                     _presentMonProcess.Start();
                     _isMonitoring = true;
                     Console.WriteLine($"Started PresentMon for PID {pid}, PID: {_presentMonProcess.Id}");
 
-                    using var outputReader = _presentMonProcess.StandardOutput; // Read FPS data
-                    using var errorReader = _presentMonProcess.StandardError; // Capture errors
+                    using var outputReader = _presentMonProcess.StandardOutput;
+                    using var errorReader = _presentMonProcess.StandardError;
 
-                    // Task to process PresentMon output
                     Task outputTask = Task.Run(async () =>
                     {
                         bool headerSkipped = false;
@@ -254,7 +253,7 @@ namespace InfoPanel.IPFPS
                                     }
                                     continue;
                                 }
-                                ProcessOutputLine(line); // Parse FPS data
+                                ProcessOutputLine(line);
                             }
                             else
                             {
@@ -265,7 +264,6 @@ namespace InfoPanel.IPFPS
                         Console.WriteLine("Output monitoring stopped.");
                     }, cancellationToken);
 
-                    // Task to log PresentMon errors
                     Task errorTask = Task.Run(async () =>
                     {
                         while (!cancellationToken.IsCancellationRequested && !_presentMonProcess.HasExited)
@@ -278,7 +276,6 @@ namespace InfoPanel.IPFPS
                         }
                     }, cancellationToken);
 
-                    // Monitor the target PID and stop if it exits
                     while (!cancellationToken.IsCancellationRequested && _isMonitoring)
                     {
                         if (!ProcessExists(pid))
@@ -290,25 +287,33 @@ namespace InfoPanel.IPFPS
                             break;
                         }
                         await Task.Delay(1000, cancellationToken);
+                        if (DateTime.Now - startTime > TimeSpan.FromSeconds(10) && _isMonitoring && !ProcessExists(pid))
+                        {
+                            Console.WriteLine($"Timeout: Forcing cleanup for PID {pid} after 10s...");
+                            StopCapture();
+                            StopPresentMonService();
+                            _currentPid = 0;
+                            break;
+                        }
                     }
 
-                    await Task.WhenAny(outputTask, errorTask); // Wait for output or error task
+                    await Task.WhenAny(outputTask, errorTask);
+                    Console.WriteLine("Capture tasks completed.");
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Failed to start or monitor PresentMon: {ex}");
                     StopCapture();
+                    _isMonitoring = false;
                 }
             }
         }
 
-        // Get the start info for PresentMon executable from the PresentMon subdirectory
         private static ProcessStartInfo? GetServiceStartInfo(string arguments)
         {
             string? pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
             if (string.IsNullOrEmpty(pluginDir)) return null;
 
-            // Look for PresentMon-2.3.0-x64.exe in the PresentMon subdirectory
             string presentMonDir = Path.Combine(pluginDir, "PresentMon");
             string path = Path.Combine(presentMonDir, $"{PresentMonAppName}.exe");
             if (!File.Exists(path))
@@ -329,7 +334,6 @@ namespace InfoPanel.IPFPS
             };
         }
 
-        // Parse PresentMon output line to update FPS and frame time sensors
         private void ProcessOutputLine(string line)
         {
             string[] parts = line.Split(',');
@@ -345,11 +349,11 @@ namespace InfoPanel.IPFPS
             {
                 _frameTimeSum += msBetweenPresents;
                 _frameCount++;
-                if (_frameCount >= SmoothWindow) // Average over 5 frames
+                if (_frameCount >= SmoothWindow)
                 {
                     float avgFrameTime = _frameTimeSum / SmoothWindow;
                     float fps = avgFrameTime > 0 ? 1000f / avgFrameTime : 0;
-                    _fpsSensor.Value = fps; // Update UI sensors
+                    _fpsSensor.Value = fps;
                     _frameTimeSensor.Value = avgFrameTime;
                     Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}");
                     _frameTimeSum = 0;
@@ -362,7 +366,6 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        // Stop PresentMon and clean up resources
         private void StopCapture()
         {
             if (_presentMonProcess == null || _presentMonProcess.HasExited)
@@ -377,12 +380,17 @@ namespace InfoPanel.IPFPS
             try
             {
                 Console.WriteLine("Stopping PresentMon...");
-                _presentMonProcess.Kill(true); // Force terminate
-                _presentMonProcess.WaitForExit(5000); // Wait up to 5s
+                _presentMonProcess.Kill(true);
+                _presentMonProcess.WaitForExit(5000);
                 if (!_presentMonProcess.HasExited)
-                    Console.WriteLine("PresentMon did not exit cleanly after kill.");
+                {
+                    Console.WriteLine("PresentMon did not exit cleanly after kill, forcing termination.");
+                    TerminateExistingPresentMonProcesses(); // Extra kill pass
+                }
                 else
+                {
                     Console.WriteLine("PresentMon stopped successfully.");
+                }
             }
             catch (Exception ex)
             {
@@ -394,17 +402,17 @@ namespace InfoPanel.IPFPS
                 _presentMonProcess = null;
                 _isMonitoring = false;
                 ResetSensors();
+                Console.WriteLine("Capture cleanup completed.");
             }
 
             if (!string.IsNullOrEmpty(_currentSessionName))
             {
                 Console.WriteLine($"Stopping ETW session: {_currentSessionName}");
-                ExecuteCommand("logman.exe", $"stop {_currentSessionName} -ets", 1000, false);
+                ExecuteCommand("logman.exe", $"stop {_currentSessionName} -ets", 1000, true);
                 _currentSessionName = null;
             }
         }
 
-        // Terminate any existing PresentMon processes on startup
         private void TerminateExistingPresentMonProcesses()
         {
             foreach (var process in Process.GetProcessesByName(PresentMonAppName))
@@ -434,18 +442,18 @@ namespace InfoPanel.IPFPS
                     Console.WriteLine($"Failed to terminate PresentMonService PID {process.Id}: {ex.Message}");
                 }
             }
+            Console.WriteLine("Existing PresentMon processes terminated.");
         }
 
-        // Reset sensor values to 0
         private void ResetSensors()
         {
             _fpsSensor.Value = 0;
             _frameTimeSensor.Value = 0;
             _frameTimeSum = 0;
             _frameCount = 0;
+            Console.WriteLine("Sensors reset.");
         }
 
-        // Execute a command (e.g., sc.exe) with optional output logging
         private void ExecuteCommand(string fileName, string arguments, int timeoutMs, bool logOutput)
         {
             try
@@ -486,17 +494,19 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        // Check if a process exists and is still running
         private bool ProcessExists(uint pid)
         {
             try
             {
                 var proc = Process.GetProcessById((int)pid);
-                return proc != null && !proc.HasExited; // Verify process is alive
+                bool exists = proc != null && !proc.HasExited && proc.MainWindowHandle != IntPtr.Zero;
+                if (!exists)
+                    Console.WriteLine($"PID {pid} no longer exists or has no main window.");
+                return exists;
             }
             catch (ArgumentException)
             {
-                Console.WriteLine($"PID {pid} no longer exists."); // Logs when process is gone
+                Console.WriteLine($"PID {pid} no longer exists.");
                 return false;
             }
             catch (Exception ex)
@@ -506,26 +516,53 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        public override void Update() { } // No synchronous updates needed
+        private bool IsReShadeActive(uint pid)
+        {
+            try
+            {
+                var proc = Process.GetProcessById((int)pid);
+                foreach (ProcessModule module in proc.Modules)
+                {
+                    if (module.ModuleName.Equals("dxgi.dll", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine($"ReShade (dxgi.dll) detected in PID {pid}.");
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error checking modules for PID {pid}: {ex.Message}");
+            }
+            return false;
+        }
 
-        public override void Close() => Dispose(); // Cleanup on plugin close
+        public override void Update() { }
 
-        // Dispose resources and ensure clean shutdown
+        public override void Close() => Dispose();
+
         public void Dispose()
         {
             Console.WriteLine("Cancellation requested.");
             try
             {
-                _cts?.Cancel(); // Stop monitoring loop
+                _cts?.Cancel();
                 if (_isMonitoring || _presentMonProcess != null)
                 {
                     Console.WriteLine("Forcing cleanup in Dispose...");
-                    StopCapture(); // Stop PresentMon if running
+                    StopCapture();
                 }
                 if (_serviceRunning)
-                    StopPresentMonService(); // Stop service if running
-                TerminateExistingPresentMonProcesses(); // Kill any leftovers
-                ClearETWSessions(); // Clear ETW sessions
+                    StopPresentMonService();
+                TerminateExistingPresentMonProcesses();
+                ClearETWSessions();
+                if (_monitoringTask != null)
+                {
+                    Console.WriteLine("Waiting for monitoring task to complete...");
+                    _monitoringTask.Wait(5000);
+                    if (!_monitoringTask.IsCompleted)
+                        Console.WriteLine("Monitoring task did not complete within 5s.");
+                }
             }
             catch (Exception ex)
             {
@@ -535,27 +572,27 @@ namespace InfoPanel.IPFPS
             {
                 _cts?.Dispose();
                 _cts = null;
+                _monitoringTask = null;
                 _currentPid = 0;
                 GC.SuppressFinalize(this);
                 Console.WriteLine("Dispose completed.");
             }
         }
 
-        // Load sensors into InfoPanel UI
         public override void Load(List<IPluginContainer> containers)
         {
             var container = new PluginContainer("FPS");
             container.Entries.Add(_fpsSensor);
             container.Entries.Add(_frameTimeSensor);
             containers.Add(container);
+            Console.WriteLine("Sensors loaded into UI.");
         }
 
         public override Task UpdateAsync(CancellationToken cancellationToken)
         {
-            return Task.CompletedTask; // No async updates needed
+            return Task.CompletedTask;
         }
 
-        // Detect the active fullscreen process
         private uint GetActiveFullscreenProcessId()
         {
             HWND hWnd = User32.GetForegroundWindow();
@@ -585,21 +622,33 @@ namespace InfoPanel.IPFPS
                 return 0;
             }
 
-            bool isFullscreen = windowRect.Equals(monitorInfo.rcMonitor); // Check if window matches monitor size
+            bool isFullscreen = windowRect.Equals(monitorInfo.rcMonitor);
             if (!isFullscreen && DwmApi.DwmGetWindowAttribute(hWnd, DwmApi.DWMWINDOWATTRIBUTE.DWMWA_EXTENDED_FRAME_BOUNDS, out RECT extendedFrameBounds).Succeeded)
-                isFullscreen = extendedFrameBounds.Equals(monitorInfo.rcMonitor); // Fallback for extended bounds
+                isFullscreen = extendedFrameBounds.Equals(monitorInfo.rcMonitor);
 
             User32.GetWindowThreadProcessId(hWnd, out uint pid);
             Console.WriteLine($"Foreground PID: {pid}, Window rect: {windowRect}, Monitor rect: {monitorInfo.rcMonitor}, Fullscreen: {isFullscreen}");
 
-            if (isFullscreen && pid > 4) // Exclude system PIDs (0-4)
+            if (isFullscreen && pid > 4 && pid != _infoPanelPid) // Exclude system PIDs and InfoPanel
             {
                 try
                 {
                     var proc = Process.GetProcessById((int)pid);
-                    if (proc.MainWindowHandle != IntPtr.Zero) // Ensure it has a main window
-                        return pid;
-                    Console.WriteLine($"PID {pid} has no main window.");
+                    if (proc.MainWindowHandle != IntPtr.Zero)
+                    {
+                        string exeName = proc.ProcessName.ToLower();
+                        // Filter for plausible game executables (add more as needed)
+                        if (exeName.Contains("sons") || exeName.Contains("game") || exeName.Contains("arma") || exeName.Contains("forest"))
+                        {
+                            Console.WriteLine($"Detected game process: {exeName}");
+                            return pid;
+                        }
+                        Console.WriteLine($"PID {pid} ({exeName}) is fullscreen but not a recognized game.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"PID {pid} has no main window.");
+                    }
                     return 0;
                 }
                 catch (ArgumentException)
@@ -609,7 +658,7 @@ namespace InfoPanel.IPFPS
                 }
             }
 
-            return 0; // No fullscreen app found
+            return 0;
         }
     }
 }
