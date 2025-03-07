@@ -2,6 +2,34 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.2.0] - 2025-03-07
+
+### Added
+- **Fullscreen/Borderless Detection**: Implemented comprehensive window enumeration using window styles (`WS_CAPTION`, `WS_THICKFRAME`) and client area matching (98%+ monitor coverage) to detect fullscreen and borderless applications universally.
+- **PresentMon Integration**: Added robust service management (`InfoPanelPresentMonService`) with start/stop functionality and ETW session cleanup via `logman.exe`.
+- **FPS and Frame Time Monitoring**: Added 5-frame window averaging for smooth FPS and frame time output using PresentMon’s CSV data.
+- **ReShade Detection**: Included detection of `dxgi.dll` in process modules, with a fallback assumption of ReShade presence on access denial for safety with anti-cheat systems.
+- **Anti-Cheat Safety**: Minimized module enumeration to reduce interference, with checks limited to `IsReShadeActive`.
+
+### Changed
+- **Exception Noise Reduction**:
+  - Replaced `Process.GetProcessById` with `Process.GetProcesses` in `ProcessExists` to eliminate `System.ArgumentException` in the debugger when games exit.
+  - Simplified `IsReShadeActive` to check `HasExited` first, reducing unnecessary `System.ComponentModel.Win32Exception` occurrences from `proc.Modules`.
+  - Suppressed `ArgumentException` logging in `ProcessExists` for expected game exits, improving log cleanliness.
+- **Type Safety**: Fixed type mismatch warnings (CS1503) by using `Vanara.PInvoke.RECT` and `Vanara.PInvoke.POINT` structs for window geometry calculations.
+- **Cleanup Logic**: Enhanced cleanup with a 10-second timeout check in `StartCaptureAsync` and forced termination of lingering PresentMon processes in `StopCapture` and `Dispose`.
+
+### Fixed
+- Resolved false positives in fullscreen detection by filtering out system UI windows (e.g., `explorer`, `textinputhost`) and small/invalid windows (client area < 1000 pixels or off-monitor).
+- Fixed "Access is denied" errors in module checking by gracefully handling exceptions in `CanAccessModules`.
+- Corrected cleanup issues ensuring PresentMon and its service stop reliably, including ETW session termination.
+
+### Known Issues
+- A `System.ComponentModel.Win32Exception` ("Access is denied") may still appear in the debugger when `IsReShadeActive` checks `proc.Modules` for games with anti-cheat protection. This is caught and handled, affecting only debug output, not functionality.
+
+### Notes
+- This release consolidates all prior development efforts into a stable version, reverting from an unstable v1.2.6 attempt that introduced `OpenProcess` for module access checking, which caused cascading exceptions (`Win32Exception`, `InvalidOperationException`) and broke PresentMon startup.
+
 ## [1.1.0] - 2025-03-05
 
 ### Final Release with Robust Cleanup

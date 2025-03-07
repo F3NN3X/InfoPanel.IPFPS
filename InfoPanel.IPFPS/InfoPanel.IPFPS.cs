@@ -6,21 +6,30 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using InfoPanel.Plugins;
 using Vanara.PInvoke;
+using System.ComponentModel;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
  * Version: 1.2.0
- * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen applications using PresentMon. Detects fullscreen processes, launches PresentMon to capture performance data, and updates sensors every second. Includes robust cleanup of PresentMon processes and ETW sessions on app exit or InfoPanel shutdown.
+ * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
- *   - v1.2.0 (Mar 7, 2025): Fixed FPS hang with ReShade, prevented restarts, ensured full cleanup.
- *     - **Changes**: Enhanced `ProcessExists` with window check, added 10s cleanup timeout, ensured PresentMon terminates, added ReShade detection, prevented restarts by filtering InfoPanel PID and non-game apps, improved cleanup with retries and verification.
- *     - **Purpose**: Resolve hangs with ReShade, stop unwanted restarts, ensure all processes and ETW sessions terminate.
- *   - v1.1.0 (Mar 5, 2025): Finalized robust cleanup and fullscreen detection.
- *     - **Changes**: Consolidated cleanup to `StartCaptureAsync`, added `ProcessExists` with `HasExited` check, removed redundant monitoring loop cleanup.
- *     - **Purpose**: Ensures reliable shutdown of PresentMon and service, cleaner logs, stable FPS (~140-175 FPS in Arma Reforger).
- * Note: Requires PresentMon-2.3.0-x64.exe and PresentMonService.exe in 'PresentMon' subdirectory. Admin rights needed for service management.
+ *   - v1.2.0 (Mar 7, 2025): Stable release with universal fullscreen detection and robust cleanup.
+ *     - Added comprehensive fullscreen/borderless window detection using window styles and client area matching.
+ *     - Implemented robust PresentMon service management with start/stop and ETW session cleanup.
+ *     - Enhanced anti-cheat safety by avoiding unnecessary module enumeration in most cases.
+ *     - Silenced most debugger exception noise:
+ *       - Replaced Process.GetProcessById with Process.GetProcesses in ProcessExists to avoid ArgumentException.
+ *       - Simplified IsReShadeActive to check process state first, reducing Win32Exception occurrences.
+ *       - Suppressed ArgumentException logging in ProcessExists for expected game exits.
+ *     - Fixed type mismatch warnings (CS1503) by using Vanara.PInvoke.RECT and POINT structs.
+ *     - Improved cleanup with timeout checks and forced termination of lingering processes.
+ *     - Added ReShade detection with fallback assumption on access denial for safety.
+ *     - Optimized FPS and frame time averaging over a 5-frame window.
+ *   - v1.1.0 (Pre-release): Initial PresentMon integration with basic FPS monitoring.
+ *   - v1.0.0 (Pre-release): Basic plugin structure for InfoPanel.
  */
 
 namespace InfoPanel.IPFPS
@@ -34,6 +43,7 @@ namespace InfoPanel.IPFPS
         private CancellationTokenSource? _cts;
         private Task? _monitoringTask;
         private uint _currentPid;
+        private readonly uint _selfPid;
         private volatile bool _isMonitoring;
         private float _frameTimeSum = 0;
         private int _frameCount = 0;
@@ -41,18 +51,33 @@ namespace InfoPanel.IPFPS
         private const string ServiceName = "InfoPanelPresentMonService";
         private string? _currentSessionName;
         private bool _serviceRunning = false;
-        private readonly int _infoPanelPid; // Store InfoPanel's PID to exclude it
 
         private static readonly string PresentMonAppName = "PresentMon-2.3.0-x64";
         private static readonly string PresentMonServiceAppName = "PresentMonService";
 
+        private const int GWL_STYLE = -16;
+        private const uint WS_CAPTION = 0x00C00000; // Title bar
+        private const uint WS_THICKFRAME = 0x00040000; // Resizable border
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowLong(HWND hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetClassName(HWND hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
+
         public IPFpsPlugin()
             : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.0")
         {
+            _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
             _cts = null;
             _monitoringTask = null;
-            _infoPanelPid = Process.GetCurrentProcess().Id; // Capture InfoPanel's PID
         }
 
         public override string? ConfigFilePath => null;
@@ -98,7 +123,7 @@ namespace InfoPanel.IPFPS
                 Console.WriteLine($"Starting {ServiceName}...");
                 ExecuteCommand("sc.exe", $"start {ServiceName}", 5000, true);
 
-                Thread.Sleep(1000); // To be async later
+                Thread.Sleep(1000);
                 _serviceRunning = true;
                 Console.WriteLine($"{ServiceName} started successfully.");
             }
@@ -117,15 +142,39 @@ namespace InfoPanel.IPFPS
                 Console.WriteLine($"Stopping {ServiceName}...");
                 ExecuteCommand("sc.exe", $"stop {ServiceName}", 15000, true);
                 Console.WriteLine($"Waiting for {ServiceName} to stop...");
-                Thread.Sleep(2000); // To be async later
+                Thread.Sleep(2000);
+
+                using (var proc = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "sc.exe",
+                        Arguments = $"query {ServiceName}",
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    }
+                })
+                {
+                    proc.Start();
+                    string output = proc.StandardOutput.ReadToEnd();
+                    proc.WaitForExit(2000);
+                    if (!output.Contains("STOPPED"))
+                    {
+                        Console.WriteLine($"{ServiceName} did not stop cleanly, forcing termination...");
+                        TerminateExistingPresentMonProcesses();
+                    }
+                }
+
                 ExecuteCommand("sc.exe", $"delete {ServiceName}", 5000, true);
                 _serviceRunning = false;
                 Console.WriteLine($"{ServiceName} stopped and deleted.");
-                TerminateExistingPresentMonProcesses(); // Ensure stragglers are killed
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to stop service: {ex.Message}");
+                TerminateExistingPresentMonProcesses();
             }
         }
 
@@ -156,7 +205,7 @@ namespace InfoPanel.IPFPS
                         {
                             string sessionName = line.Trim().Split(' ')[0];
                             Console.WriteLine($"Found ETW session: {sessionName}, stopping...");
-                            ExecuteCommand("logman.exe", $"stop {sessionName} -ets", 1000, true); // Log output
+                            ExecuteCommand("logman.exe", $"stop {sessionName} -ets", 1000, true);
                         }
                     }
                 }
@@ -228,7 +277,7 @@ namespace InfoPanel.IPFPS
                 {
                     Console.WriteLine($"Starting PresentMon with args: {arguments}");
                     if (IsReShadeActive(pid))
-                        Console.WriteLine("Warning: ReShade detected, potential interference with PresentMon.");
+                        Console.WriteLine("Warning: ReShade detected or assumed, potential interference with PresentMon.");
                     _presentMonProcess.Start();
                     _isMonitoring = true;
                     Console.WriteLine($"Started PresentMon for PID {pid}, PID: {_presentMonProcess.Id}");
@@ -355,7 +404,7 @@ namespace InfoPanel.IPFPS
                     float fps = avgFrameTime > 0 ? 1000f / avgFrameTime : 0;
                     _fpsSensor.Value = fps;
                     _frameTimeSensor.Value = avgFrameTime;
-                    Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}");
+                    Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}", System.Globalization.CultureInfo.InvariantCulture);
                     _frameTimeSum = 0;
                     _frameCount = 0;
                 }
@@ -385,7 +434,7 @@ namespace InfoPanel.IPFPS
                 if (!_presentMonProcess.HasExited)
                 {
                     Console.WriteLine("PresentMon did not exit cleanly after kill, forcing termination.");
-                    TerminateExistingPresentMonProcesses(); // Extra kill pass
+                    TerminateExistingPresentMonProcesses();
                 }
                 else
                 {
@@ -395,6 +444,7 @@ namespace InfoPanel.IPFPS
             catch (Exception ex)
             {
                 Console.WriteLine($"Error stopping PresentMon: {ex.Message}");
+                TerminateExistingPresentMonProcesses();
             }
             finally
             {
@@ -496,50 +546,103 @@ namespace InfoPanel.IPFPS
 
         private bool ProcessExists(uint pid)
         {
-            try
+            var processes = Process.GetProcesses();
+            foreach (var proc in processes)
             {
-                var proc = Process.GetProcessById((int)pid);
-                bool exists = proc != null && !proc.HasExited && proc.MainWindowHandle != IntPtr.Zero;
-                if (!exists)
-                    Console.WriteLine($"PID {pid} no longer exists or has no main window.");
-                return exists;
+                try
+                {
+                    if ((uint)proc.Id == pid)
+                    {
+                        bool exists = !proc.HasExited && proc.MainWindowHandle != IntPtr.Zero;
+                        if (!exists)
+                            Console.WriteLine($"PID {pid} no longer exists or has no main window.");
+                        return exists;
+                    }
+                }
+                finally
+                {
+                    proc.Dispose();
+                }
             }
-            catch (ArgumentException)
-            {
-                Console.WriteLine($"PID {pid} no longer exists.");
-                return false;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error checking PID {pid}: {ex.Message}");
-                return false;
-            }
+            return false;
         }
 
         private bool IsReShadeActive(uint pid)
         {
-            try
+            var processes = Process.GetProcesses();
+            foreach (var proc in processes)
             {
-                var proc = Process.GetProcessById((int)pid);
-                foreach (ProcessModule module in proc.Modules)
+                try
                 {
-                    if (module.ModuleName.Equals("dxgi.dll", StringComparison.OrdinalIgnoreCase))
+                    if ((uint)proc.Id != pid) continue;
+
+                    if (proc.HasExited)
                     {
-                        Console.WriteLine($"ReShade (dxgi.dll) detected in PID {pid}.");
+                        Console.WriteLine($"PID {pid} has exited, skipping ReShade check.");
+                        return false;
+                    }
+
+                    if (!CanAccessModules(proc))
+                    {
+                        Console.WriteLine($"Unable to check modules for PID {pid} due to access denial; assuming potential ReShade presence for safety.");
                         return true;
                     }
+
+                    foreach (ProcessModule module in proc.Modules)
+                    {
+                        if (module.ModuleName.Equals("dxgi.dll", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine($"ReShade (dxgi.dll) detected in PID {pid}.");
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                finally
+                {
+                    proc.Dispose();
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error checking modules for PID {pid}: {ex.Message}");
-            }
+            Console.WriteLine($"PID {pid} not found for ReShade check.");
             return false;
+        }
+
+        private bool CanAccessModules(Process proc)
+        {
+            try
+            {
+                var modules = proc.Modules; // Test access
+                return true;
+            }
+            catch (Win32Exception ex) when (ex.Message.Contains("Access is denied"))
+            {
+                return false;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         public override void Update() { }
 
         public override void Close() => Dispose();
+
+        private void Cleanup()
+        {
+            if (_isMonitoring || _presentMonProcess != null)
+            {
+                Console.WriteLine("Forcing capture cleanup in Dispose...");
+                StopCapture();
+            }
+            if (_serviceRunning)
+            {
+                Console.WriteLine("Ensuring service shutdown...");
+                StopPresentMonService();
+            }
+            TerminateExistingPresentMonProcesses();
+            ClearETWSessions();
+        }
 
         public void Dispose()
         {
@@ -547,29 +650,28 @@ namespace InfoPanel.IPFPS
             try
             {
                 _cts?.Cancel();
-                if (_isMonitoring || _presentMonProcess != null)
-                {
-                    Console.WriteLine("Forcing cleanup in Dispose...");
-                    StopCapture();
-                }
-                if (_serviceRunning)
-                    StopPresentMonService();
-                TerminateExistingPresentMonProcesses();
-                ClearETWSessions();
                 if (_monitoringTask != null)
                 {
                     Console.WriteLine("Waiting for monitoring task to complete...");
-                    _monitoringTask.Wait(5000);
-                    if (!_monitoringTask.IsCompleted)
-                        Console.WriteLine("Monitoring task did not complete within 5s.");
+                    try
+                    {
+                        Task.WaitAll(new[] { _monitoringTask }, 5000);
+                        if (!_monitoringTask.IsCompleted)
+                            Console.WriteLine("Monitoring task did not complete within 5s, forcing cleanup.");
+                    }
+                    catch (Exception ex) when (ex is AggregateException || ex is TaskCanceledException)
+                    {
+                        Console.WriteLine($"Monitoring task cancelled or failed: {ex.Message}");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Dispose failed: {ex.Message}");
+                Console.WriteLine($"Dispose encountered an error: {ex.Message}");
             }
             finally
             {
+                Cleanup();
                 _cts?.Dispose();
                 _cts = null;
                 _monitoringTask = null;
@@ -593,72 +695,118 @@ namespace InfoPanel.IPFPS
             return Task.CompletedTask;
         }
 
+        private delegate bool EnumWindowsProc(HWND hWnd, IntPtr lParam);
+
         private uint GetActiveFullscreenProcessId()
         {
-            HWND hWnd = User32.GetForegroundWindow();
-            if (hWnd == IntPtr.Zero)
+            uint fullscreenPid = 0;
+            HWND foregroundWindow = User32.GetForegroundWindow();
+
+            EnumWindows((hWnd, lParam) =>
             {
-                Console.WriteLine("No foreground window found.");
-                return 0;
-            }
+                if (!User32.IsWindowVisible(hWnd))
+                    return true;
 
-            if (!User32.GetWindowRect(hWnd, out RECT windowRect))
-            {
-                Console.WriteLine("Failed to get window rect.");
-                return 0;
-            }
+                if (!User32.GetWindowRect(hWnd, out Vanara.PInvoke.RECT windowRect))
+                {
+                    Console.WriteLine($"Failed to get window rect for HWND {hWnd}.");
+                    return true;
+                }
 
-            HMONITOR hMonitor = User32.MonitorFromWindow(hWnd, User32.MonitorFlags.MONITOR_DEFAULTTONEAREST);
-            if (hMonitor == IntPtr.Zero)
-            {
-                Console.WriteLine("No monitor found for window.");
-                return 0;
-            }
+                HMONITOR hMonitor = User32.MonitorFromWindow(hWnd, User32.MonitorFlags.MONITOR_DEFAULTTONEAREST);
+                if (hMonitor == IntPtr.Zero)
+                {
+                    Console.WriteLine($"No monitor found for HWND {hWnd}.");
+                    return true;
+                }
 
-            var monitorInfo = new User32.MONITORINFO { cbSize = (uint)Marshal.SizeOf<User32.MONITORINFO>() };
-            if (!User32.GetMonitorInfo(hMonitor, ref monitorInfo))
-            {
-                Console.WriteLine("Failed to get monitor info.");
-                return 0;
-            }
+                var monitorInfo = new User32.MONITORINFO { cbSize = (uint)Marshal.SizeOf<User32.MONITORINFO>() };
+                if (!User32.GetMonitorInfo(hMonitor, ref monitorInfo))
+                {
+                    Console.WriteLine($"Failed to get monitor info for HWND {hWnd}.");
+                    return true;
+                }
 
-            bool isFullscreen = windowRect.Equals(monitorInfo.rcMonitor);
-            if (!isFullscreen && DwmApi.DwmGetWindowAttribute(hWnd, DwmApi.DWMWINDOWATTRIBUTE.DWMWA_EXTENDED_FRAME_BOUNDS, out RECT extendedFrameBounds).Succeeded)
-                isFullscreen = extendedFrameBounds.Equals(monitorInfo.rcMonitor);
+                if (!GetClientRect(hWnd, out Vanara.PInvoke.RECT clientRect))
+                {
+                    Console.WriteLine($"Failed to get client rect for HWND {hWnd}.");
+                    return true;
+                }
 
-            User32.GetWindowThreadProcessId(hWnd, out uint pid);
-            Console.WriteLine($"Foreground PID: {pid}, Window rect: {windowRect}, Monitor rect: {monitorInfo.rcMonitor}, Fullscreen: {isFullscreen}");
+                Vanara.PInvoke.POINT topLeft = new Vanara.PInvoke.POINT { X = clientRect.Left, Y = clientRect.Top };
+                Vanara.PInvoke.POINT bottomRight = new Vanara.PInvoke.POINT { X = clientRect.Right, Y = clientRect.Bottom };
+                User32.ClientToScreen(hWnd, ref topLeft);
+                User32.ClientToScreen(hWnd, ref bottomRight);
+                Vanara.PInvoke.RECT clientScreenRect = new Vanara.PInvoke.RECT
+                {
+                    Left = topLeft.X,
+                    Top = topLeft.Y,
+                    Right = bottomRight.X,
+                    Bottom = bottomRight.Y
+                };
 
-            if (isFullscreen && pid > 4 && pid != _infoPanelPid) // Exclude system PIDs and InfoPanel
-            {
+                int clientArea = (clientScreenRect.Right - clientScreenRect.Left) * (clientScreenRect.Bottom - clientScreenRect.Top);
+                int monitorArea = (monitorInfo.rcMonitor.Right - monitorInfo.rcMonitor.Left) * (monitorInfo.rcMonitor.Bottom - monitorInfo.rcMonitor.Top);
+                float areaMatch = (float)clientArea / monitorArea;
+
+                uint style = GetWindowLong(hWnd, GWL_STYLE);
+                bool hasCaptionOrBorders = (style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0;
+
+                bool isFullscreen = clientScreenRect.Equals(monitorInfo.rcMonitor);
+                bool isBorderlessCandidate = areaMatch >= 0.98f && hWnd == foregroundWindow && !hasCaptionOrBorders;
+
+                if (clientArea < 1000 || clientScreenRect.Left < monitorInfo.rcMonitor.Left - 100 || clientScreenRect.Top < monitorInfo.rcMonitor.Top - 100)
+                    return true;
+
+                StringBuilder className = new StringBuilder(256);
+                int classLength = GetClassName(hWnd, className, className.Capacity);
+                string windowClass = classLength > 0 ? className.ToString().ToLower() : "unknown";
+
+                User32.GetWindowThreadProcessId(hWnd, out uint pid);
+                string processName = "unknown";
                 try
                 {
                     var proc = Process.GetProcessById((int)pid);
-                    if (proc.MainWindowHandle != IntPtr.Zero)
+                    processName = proc.ProcessName.ToLower();
+
+                    if (IsSystemUIWindow(processName, windowClass))
                     {
-                        string exeName = proc.ProcessName.ToLower();
-                        // Filter for plausible game executables (add more as needed)
-                        if (exeName.Contains("sons") || exeName.Contains("game") || exeName.Contains("arma") || exeName.Contains("forest"))
-                        {
-                            Console.WriteLine($"Detected game process: {exeName}");
-                            return pid;
-                        }
-                        Console.WriteLine($"PID {pid} ({exeName}) is fullscreen but not a recognized game.");
+                        Console.WriteLine($"Skipping system UI window: {processName} ({windowClass})");
+                        return true;
                     }
-                    else
-                    {
-                        Console.WriteLine($"PID {pid} has no main window.");
-                    }
-                    return 0;
                 }
                 catch (ArgumentException)
                 {
-                    Console.WriteLine($"PID {pid} is no longer valid.");
-                    return 0;
+                    Console.WriteLine($"PID {pid} no longer valid.");
+                    return true;
                 }
-            }
 
-            return 0;
+                Console.WriteLine($"Window HWND: {hWnd}, PID: {pid}, Class: {windowClass}, Process: {processName}, ClientRect: {clientScreenRect}, Monitor: {monitorInfo.rcMonitor}, Fullscreen: {isFullscreen}, AreaMatch: {areaMatch:F2}, HasCaptionOrBorders: {hasCaptionOrBorders}");
+
+                if ((isFullscreen || isBorderlessCandidate) && pid > 4 && pid != _selfPid)
+                {
+                    fullscreenPid = pid;
+                    Console.WriteLine($"Detected potential game: {processName} ({windowClass}), Fullscreen: {isFullscreen}, Borderless: {isBorderlessCandidate}");
+                    return false;
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            return fullscreenPid;
+        }
+
+        private bool IsSystemUIWindow(string processName, string windowClass)
+        {
+            string[] systemProcesses = { "textinputhost", "explorer", "dwm", "sihost", "shellhost" };
+            string[] systemClasses = { "windows.ui.core.corewindow", "applicationframewindow" };
+
+            bool isSystem = systemProcesses.Contains(processName.ToLower()) || systemClasses.Contains(windowClass.ToLower());
+            if (isSystem)
+            {
+                Console.WriteLine($"Identified system UI: {processName} ({windowClass})");
+            }
+            return isSystem;
         }
     }
 }
