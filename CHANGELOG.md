@@ -2,6 +2,17 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.2.3] - 2025-03-08
+- **Fixed**: Bypassed ReShade check for anti-cheat protected games to avoid `Win32Exception` due to access denial. Added `GetProcessName` to safely identify processes and skip unnecessary checks.
+- **Restored**: Functionality from v1.2.1 with stability fixes.
+  - Fixed `StartAsync` to prevent task completion races and added PID logging for debugging.
+  - Simplified `StartCaptureAsync` to ensure reliable output capture and added error logging for PresentMon diagnostics.
+  - Retained robust fullscreen detection and service management from v1.2.1.
+  - Avoided LINQ in `ProcessExists` to prevent disposal-related crashes.
+
+## [1.2.1] - 2025-03-08
+- **Improved**: Asynchronous optimization phase 1, fixed race condition in process monitoring.
+
 ## [1.2.0] - 2025-03-07
 
 ### Added
