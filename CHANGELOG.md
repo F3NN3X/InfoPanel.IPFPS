@@ -2,6 +2,11 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.2.4] - 2025-03-08
+- **Fixed**: Removed hardcoded game check, making the plugin agnostic to specific apps.
+  - Replaced with generic handling of access-denied cases in `IsReShadeActive`, assuming no ReShade interference unless `dxgi.dll` is confirmed.
+- **Fixed**: Resolved `CS8600` warning by declaring `processName` as `string?` in `StartCaptureAsync`.
+
 ## [1.2.3] - 2025-03-08
 - **Fixed**: Bypassed ReShade check for anti-cheat protected games to avoid `Win32Exception` due to access denial. Added `GetProcessName` to safely identify processes and skip unnecessary checks.
 - **Restored**: Functionality from v1.2.1 with stability fixes.

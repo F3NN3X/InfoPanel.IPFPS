@@ -13,16 +13,15 @@ using System.ComponentModel;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.2.3
+ * Version: 1.2.4
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
+ *   - v1.2.4 (Mar 8, 2025): Removed hardcoded game check, fixed nullability warning.
+ *     - Replaced Arma-specific ReShade bypass with generic handling of access-denied cases in IsReShadeActive.
+ *     - Fixed CS8600 warning by declaring processName as string? in StartCaptureAsync.
  *   - v1.2.3 (Mar 8, 2025): Bypassed ReShade check for anti-cheat protected games.
- *     - Skips IsReShadeActive for Arma Reforger to avoid Win32Exception due to BattlEye access denial.
+ *     - Skipped IsReShadeActive for Arma Reforger to avoid Win32Exception due to BattlEye access denial.
  *   - v1.2.2 (Mar 8, 2025): Restored functionality from v1.2.1 with stability fixes.
- *     - Fixed StartAsync to prevent task completion races and added PID logging.
- *     - Simplified StartCaptureAsync to ensure reliable output capture and added error logging.
- *     - Retained robust fullscreen detection and service management from v1.2.1.
- *     - Avoided LINQ in ProcessExists to prevent disposal-related crashes.
  *   - v1.2.1 (Mar 8, 2025): Asynchronous optimization phase 1, fixed race condition.
  *   - v1.2.0 (Mar 7, 2025): Stable release with fullscreen detection and cleanup.
  */
@@ -67,7 +66,7 @@ namespace InfoPanel.IPFPS
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.3")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.4")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -411,14 +410,10 @@ namespace InfoPanel.IPFPS
             try
             {
                 Console.WriteLine($"Starting PresentMon with args: {arguments}");
-                string processName = GetProcessName(pid);
-                if (processName != null && processName.Equals("armareforgersteam", StringComparison.OrdinalIgnoreCase))
+                string? processName = GetProcessName(pid);
+                if (processName != null && IsReShadeActive(pid))
                 {
-                    Console.WriteLine("Skipping ReShade check for Arma Reforger due to anti-cheat protection.");
-                }
-                else if (IsReShadeActive(pid))
-                {
-                    Console.WriteLine("Warning: ReShade detected or assumed, potential interference with PresentMon.");
+                    Console.WriteLine($"Warning: ReShade detected in process {processName} (PID {pid}), potential interference with PresentMon.");
                 }
 
                 bool started = await StartAsync(_presentMonProcess).ConfigureAwait(false);
@@ -679,8 +674,8 @@ namespace InfoPanel.IPFPS
 
                     if (!CanAccessModules(proc))
                     {
-                        Console.WriteLine($"Unable to check modules for PID {pid} due to access denial; assuming potential ReShade presence for safety.");
-                        return true;
+                        Console.WriteLine($"Unable to check modules for PID {pid} due to access denial (possibly anti-cheat); assuming no ReShade interference.");
+                        return false; // Changed to false to avoid unnecessary warnings
                     }
 
                     foreach (ProcessModule module in proc.Modules)
