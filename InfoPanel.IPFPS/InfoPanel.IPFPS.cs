@@ -13,20 +13,22 @@ using System.ComponentModel;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.2.0
+ * Version: 1.2.1
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
+ *   - v1.2.1 (Mar 8, 2025): Asynchronous optimization phase 1, fixed race condition.
+ *     - Refactored ExecuteCommand to asynchronous using Process.StartAsync and ReadToEndAsync for better responsiveness.
+ *     - Updated StartPresentMonService, StopPresentMonService, ClearETWSessions, and TerminateExistingPresentMonProcesses to async with Task.Delay.
+ *     - Ensured consistent Process disposal with using statements in updated methods.
+ *     - Fixed race condition in StartCaptureAsync/StopCapture by moving _presentMonProcess disposal to async StopCapture, avoiding premature disposal.
  *   - v1.2.0 (Mar 7, 2025): Stable release with universal fullscreen detection and robust cleanup.
  *     - Added comprehensive fullscreen/borderless window detection using window styles and client area matching.
  *     - Implemented robust PresentMon service management with start/stop and ETW session cleanup.
  *     - Enhanced anti-cheat safety by avoiding unnecessary module enumeration in most cases.
- *     - Silenced most debugger exception noise:
- *       - Replaced Process.GetProcessById with Process.GetProcesses in ProcessExists to avoid ArgumentException.
- *       - Simplified IsReShadeActive to check process state first, reducing Win32Exception occurrences.
- *       - Suppressed ArgumentException logging in ProcessExists for expected game exits.
- *     - Fixed type mismatch warnings (CS1503) by using Vanara.PInvoke.RECT and POINT structs.
- *     - Improved cleanup with timeout checks and forced termination of lingering processes.
- *     - Added ReShade detection with fallback assumption on access denial for safety.
+ *     - Silenced most debugger exception noise (ProcessExists uses GetProcesses, IsReShadeActive checks HasExited first).
+ *     - Fixed type mismatch warnings (CS1503) with Vanara.PInvoke.RECT and POINT structs.
+ *     - Improved cleanup with timeout checks and forced termination.
+ *     - Added ReShade detection with fallback assumption on access denial.
  *     - Optimized FPS and frame time averaging over a 5-frame window.
  *   - v1.1.0 (Pre-release): Initial PresentMon integration with basic FPS monitoring.
  *   - v1.0.0 (Pre-release): Basic plugin structure for InfoPanel.
@@ -72,7 +74,7 @@ namespace InfoPanel.IPFPS
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.0")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.1")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -86,14 +88,79 @@ namespace InfoPanel.IPFPS
         public override void Initialize()
         {
             Console.WriteLine("Initializing IPFpsPlugin...");
-            TerminateExistingPresentMonProcesses();
-            ClearETWSessions();
+            TerminateExistingPresentMonProcessesAsync(CancellationToken.None).GetAwaiter().GetResult();
+            ClearETWSessionsAsync(CancellationToken.None).GetAwaiter().GetResult();
             _cts = new CancellationTokenSource();
             _monitoringTask = Task.Run(() => StartMonitoringLoopAsync(_cts.Token));
             Console.WriteLine("Monitoring task started.");
         }
 
-        private void StartPresentMonService()
+        private static Task StartAsync(Process process)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            process.EnableRaisingEvents = true;
+            process.Exited += (s, e) => tcs.TrySetResult(true);
+            if (!process.Start())
+            {
+                tcs.TrySetException(new InvalidOperationException("Failed to start process."));
+            }
+            return tcs.Task;
+        }
+
+        private async Task ExecuteCommandAsync(string fileName, string arguments, int timeoutMs, bool logOutput, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using (var proc = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = fileName,
+                        Arguments = arguments,
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = logOutput,
+                        RedirectStandardError = logOutput
+                    }
+                })
+                {
+                    await StartAsync(proc).ConfigureAwait(false);
+
+                    if (logOutput)
+                    {
+                        string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+                        string error = await proc.StandardError.ReadToEndAsync().ConfigureAwait(false);
+
+                        if (await Task.Run(() => proc.WaitForExit(timeoutMs), cancellationToken).ConfigureAwait(false))
+                        {
+                            if (proc.ExitCode == 0)
+                                Console.WriteLine($"{fileName} {arguments}: {output}");
+                            else
+                                Console.WriteLine($"{fileName} {arguments} failed: {error}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
+                            proc.Kill(true);
+                        }
+                    }
+                    else
+                    {
+                        if (!await Task.Run(() => proc.WaitForExit(timeoutMs), cancellationToken).ConfigureAwait(false))
+                        {
+                            Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
+                            proc.Kill(true);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to execute {fileName} {arguments}: {ex.Message}");
+            }
+        }
+
+        private async Task StartPresentMonServiceAsync(CancellationToken cancellationToken)
         {
             if (_serviceRunning) return;
 
@@ -114,16 +181,16 @@ namespace InfoPanel.IPFPS
 
             try
             {
-                ExecuteCommand("sc.exe", $"stop {ServiceName}", 5000, false);
-                ExecuteCommand("sc.exe", $"delete {ServiceName}", 5000, false);
+                await ExecuteCommandAsync("sc.exe", $"stop {ServiceName}", 5000, false, cancellationToken).ConfigureAwait(false);
+                await ExecuteCommandAsync("sc.exe", $"delete {ServiceName}", 5000, false, cancellationToken).ConfigureAwait(false);
 
                 Console.WriteLine($"Installing PresentMonService as {ServiceName}...");
-                ExecuteCommand("sc.exe", $"create {ServiceName} binPath= \"{servicePath}\" start= demand", 5000, true);
+                await ExecuteCommandAsync("sc.exe", $"create {ServiceName} binPath= \"{servicePath}\" start= demand", 5000, true, cancellationToken).ConfigureAwait(false);
 
                 Console.WriteLine($"Starting {ServiceName}...");
-                ExecuteCommand("sc.exe", $"start {ServiceName}", 5000, true);
+                await ExecuteCommandAsync("sc.exe", $"start {ServiceName}", 5000, true, cancellationToken).ConfigureAwait(false);
 
-                Thread.Sleep(1000);
+                await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
                 _serviceRunning = true;
                 Console.WriteLine($"{ServiceName} started successfully.");
             }
@@ -133,16 +200,16 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        private void StopPresentMonService()
+        private async Task StopPresentMonServiceAsync(CancellationToken cancellationToken)
         {
             if (!_serviceRunning) return;
 
             try
             {
                 Console.WriteLine($"Stopping {ServiceName}...");
-                ExecuteCommand("sc.exe", $"stop {ServiceName}", 15000, true);
+                await ExecuteCommandAsync("sc.exe", $"stop {ServiceName}", 15000, true, cancellationToken).ConfigureAwait(false);
                 Console.WriteLine($"Waiting for {ServiceName} to stop...");
-                Thread.Sleep(2000);
+                await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
 
                 using (var proc = new Process
                 {
@@ -157,28 +224,28 @@ namespace InfoPanel.IPFPS
                     }
                 })
                 {
-                    proc.Start();
-                    string output = proc.StandardOutput.ReadToEnd();
-                    proc.WaitForExit(2000);
+                    await StartAsync(proc).ConfigureAwait(false);
+                    string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+                    await Task.Run(() => proc.WaitForExit(2000), cancellationToken).ConfigureAwait(false);
                     if (!output.Contains("STOPPED"))
                     {
                         Console.WriteLine($"{ServiceName} did not stop cleanly, forcing termination...");
-                        TerminateExistingPresentMonProcesses();
+                        await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
                     }
                 }
 
-                ExecuteCommand("sc.exe", $"delete {ServiceName}", 5000, true);
+                await ExecuteCommandAsync("sc.exe", $"delete {ServiceName}", 5000, true, cancellationToken).ConfigureAwait(false);
                 _serviceRunning = false;
                 Console.WriteLine($"{ServiceName} stopped and deleted.");
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to stop service: {ex.Message}");
-                TerminateExistingPresentMonProcesses();
+                await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private void ClearETWSessions()
+        private async Task ClearETWSessionsAsync(CancellationToken cancellationToken)
         {
             try
             {
@@ -195,9 +262,9 @@ namespace InfoPanel.IPFPS
                     }
                 })
                 {
-                    proc.Start();
-                    string output = proc.StandardOutput.ReadToEnd();
-                    proc.WaitForExit(2000);
+                    await StartAsync(proc).ConfigureAwait(false);
+                    string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+                    await Task.Run(() => proc.WaitForExit(2000), cancellationToken).ConfigureAwait(false);
                     string[] lines = output.Split('\n');
                     foreach (string line in lines)
                     {
@@ -205,7 +272,7 @@ namespace InfoPanel.IPFPS
                         {
                             string sessionName = line.Trim().Split(' ')[0];
                             Console.WriteLine($"Found ETW session: {sessionName}, stopping...");
-                            ExecuteCommand("logman.exe", $"stop {sessionName} -ets", 1000, true);
+                            await ExecuteCommandAsync("logman.exe", $"stop {sessionName} -ets", 1000, true, cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }
@@ -215,6 +282,46 @@ namespace InfoPanel.IPFPS
             {
                 Console.WriteLine($"Failed to clear ETW sessions: {ex.Message}");
             }
+        }
+
+        private async Task TerminateExistingPresentMonProcessesAsync(CancellationToken cancellationToken)
+        {
+            foreach (var process in Process.GetProcessesByName(PresentMonAppName))
+            {
+                try
+                {
+                    process.Kill(true);
+                    await Task.Run(() => process.WaitForExit(1000), cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($"Terminated PresentMon PID: {process.Id}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to terminate PresentMon PID {process.Id}: {ex.Message}");
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+
+            foreach (var process in Process.GetProcessesByName(PresentMonServiceAppName))
+            {
+                try
+                {
+                    process.Kill(true);
+                    await Task.Run(() => process.WaitForExit(1000), cancellationToken).ConfigureAwait(false);
+                    Console.WriteLine($"Terminated PresentMonService PID: {process.Id}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to terminate PresentMonService PID {process.Id}: {ex.Message}");
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+            Console.WriteLine("Existing PresentMon processes terminated.");
         }
 
         private async Task StartMonitoringLoopAsync(CancellationToken cancellationToken)
@@ -230,11 +337,11 @@ namespace InfoPanel.IPFPS
                     if (pid != 0 && pid != _currentPid && !_isMonitoring)
                     {
                         _currentPid = pid;
-                        StartPresentMonService();
-                        await StartCaptureAsync(pid, cancellationToken);
+                        await StartPresentMonServiceAsync(cancellationToken).ConfigureAwait(false);
+                        await StartCaptureAsync(pid, cancellationToken).ConfigureAwait(false);
                     }
 
-                    await Task.Delay(1000, cancellationToken);
+                    await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException)
@@ -253,7 +360,10 @@ namespace InfoPanel.IPFPS
 
         private async Task StartCaptureAsync(uint pid, CancellationToken cancellationToken)
         {
-            if (_presentMonProcess != null) StopCapture();
+            if (_presentMonProcess != null)
+            {
+                await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
+            }
 
             _currentSessionName = $"PresentMon_{Guid.NewGuid():N}";
             string arguments = $"--process_id {pid} --output_stdout --terminate_on_proc_exit --stop_existing_session --session_name {_currentSessionName}";
@@ -265,96 +375,94 @@ namespace InfoPanel.IPFPS
             }
 
             DateTime startTime = DateTime.Now;
-            using (_presentMonProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true })
+            _presentMonProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            _presentMonProcess.Exited += (s, e) =>
             {
-                _presentMonProcess.Exited += (s, e) =>
+                Console.WriteLine($"PresentMon exited with code: {_presentMonProcess?.ExitCode ?? -1}");
+                _isMonitoring = false;
+            };
+
+            try
+            {
+                Console.WriteLine($"Starting PresentMon with args: {arguments}");
+                if (IsReShadeActive(pid))
+                    Console.WriteLine("Warning: ReShade detected or assumed, potential interference with PresentMon.");
+                _presentMonProcess.Start();
+                _isMonitoring = true;
+                Console.WriteLine($"Started PresentMon for PID {pid}, PID: {_presentMonProcess.Id}");
+
+                using var outputReader = _presentMonProcess.StandardOutput;
+                using var errorReader = _presentMonProcess.StandardError;
+
+                Task outputTask = Task.Run(async () =>
                 {
-                    Console.WriteLine($"PresentMon exited with code: {_presentMonProcess?.ExitCode ?? -1}");
-                    _isMonitoring = false;
-                };
-
-                try
-                {
-                    Console.WriteLine($"Starting PresentMon with args: {arguments}");
-                    if (IsReShadeActive(pid))
-                        Console.WriteLine("Warning: ReShade detected or assumed, potential interference with PresentMon.");
-                    _presentMonProcess.Start();
-                    _isMonitoring = true;
-                    Console.WriteLine($"Started PresentMon for PID {pid}, PID: {_presentMonProcess.Id}");
-
-                    using var outputReader = _presentMonProcess.StandardOutput;
-                    using var errorReader = _presentMonProcess.StandardError;
-
-                    Task outputTask = Task.Run(async () =>
+                    bool headerSkipped = false;
+                    while (!cancellationToken.IsCancellationRequested && (_presentMonProcess?.HasExited == false))
                     {
-                        bool headerSkipped = false;
-                        while (!cancellationToken.IsCancellationRequested && !_presentMonProcess.HasExited)
+                        string? line = await outputReader.ReadLineAsync().ConfigureAwait(false);
+                        if (line != null)
                         {
-                            string? line = await outputReader.ReadLineAsync();
-                            if (line != null)
+                            if (!headerSkipped)
                             {
-                                if (!headerSkipped)
+                                if (line.StartsWith("Application", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (line.StartsWith("Application", StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        headerSkipped = true;
-                                        Console.WriteLine("Skipped PresentMon CSV header.");
-                                    }
-                                    continue;
+                                    headerSkipped = true;
+                                    Console.WriteLine("Skipped PresentMon CSV header.");
                                 }
-                                ProcessOutputLine(line);
+                                continue;
                             }
-                            else
-                            {
-                                Console.WriteLine("Output stream ended.");
-                                break;
-                            }
+                            ProcessOutputLine(line);
                         }
-                        Console.WriteLine("Output monitoring stopped.");
-                    }, cancellationToken);
-
-                    Task errorTask = Task.Run(async () =>
-                    {
-                        while (!cancellationToken.IsCancellationRequested && !_presentMonProcess.HasExited)
+                        else
                         {
-                            string? line = await errorReader.ReadLineAsync();
-                            if (line != null)
-                                Console.WriteLine($"Error: {line}");
-                            else
-                                break;
-                        }
-                    }, cancellationToken);
-
-                    while (!cancellationToken.IsCancellationRequested && _isMonitoring)
-                    {
-                        if (!ProcessExists(pid))
-                        {
-                            Console.WriteLine($"Target PID {pid} gone, initiating cleanup...");
-                            StopCapture();
-                            StopPresentMonService();
-                            _currentPid = 0;
-                            break;
-                        }
-                        await Task.Delay(1000, cancellationToken);
-                        if (DateTime.Now - startTime > TimeSpan.FromSeconds(10) && _isMonitoring && !ProcessExists(pid))
-                        {
-                            Console.WriteLine($"Timeout: Forcing cleanup for PID {pid} after 10s...");
-                            StopCapture();
-                            StopPresentMonService();
-                            _currentPid = 0;
+                            Console.WriteLine("Output stream ended.");
                             break;
                         }
                     }
+                    Console.WriteLine("Output monitoring stopped.");
+                }, cancellationToken);
 
-                    await Task.WhenAny(outputTask, errorTask);
-                    Console.WriteLine("Capture tasks completed.");
-                }
-                catch (Exception ex)
+                Task errorTask = Task.Run(async () =>
                 {
-                    Console.WriteLine($"Failed to start or monitor PresentMon: {ex}");
-                    StopCapture();
-                    _isMonitoring = false;
+                    while (!cancellationToken.IsCancellationRequested && (_presentMonProcess?.HasExited == false))
+                    {
+                        string? line = await errorReader.ReadLineAsync().ConfigureAwait(false);
+                        if (line != null)
+                            Console.WriteLine($"Error: {line}");
+                        else
+                            break;
+                    }
+                }, cancellationToken);
+
+                while (!cancellationToken.IsCancellationRequested && _isMonitoring)
+                {
+                    if (!ProcessExists(pid))
+                    {
+                        Console.WriteLine($"Target PID {pid} gone, initiating cleanup...");
+                        await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
+                        await StopPresentMonServiceAsync(cancellationToken).ConfigureAwait(false);
+                        _currentPid = 0;
+                        break;
+                    }
+                    await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+                    if (DateTime.Now - startTime > TimeSpan.FromSeconds(10) && _isMonitoring && !ProcessExists(pid))
+                    {
+                        Console.WriteLine($"Timeout: Forcing cleanup for PID {pid} after 10s...");
+                        await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
+                        await StopPresentMonServiceAsync(cancellationToken).ConfigureAwait(false);
+                        _currentPid = 0;
+                        break;
+                    }
                 }
+
+                await Task.WhenAny(outputTask, errorTask).ConfigureAwait(false);
+                Console.WriteLine("Capture tasks completed.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to start or monitor PresentMon: {ex}");
+                await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
+                _isMonitoring = false;
             }
         }
 
@@ -415,12 +523,13 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        private void StopCapture()
+        private async Task StopCaptureAsync(CancellationToken cancellationToken)
         {
             if (_presentMonProcess == null || _presentMonProcess.HasExited)
             {
                 Console.WriteLine("PresentMon already stopped or not started.");
                 _isMonitoring = false;
+                _presentMonProcess?.Dispose();
                 _presentMonProcess = null;
                 ResetSensors();
                 return;
@@ -430,11 +539,11 @@ namespace InfoPanel.IPFPS
             {
                 Console.WriteLine("Stopping PresentMon...");
                 _presentMonProcess.Kill(true);
-                _presentMonProcess.WaitForExit(5000);
+                await Task.Run(() => _presentMonProcess.WaitForExit(5000), cancellationToken).ConfigureAwait(false);
                 if (!_presentMonProcess.HasExited)
                 {
                     Console.WriteLine("PresentMon did not exit cleanly after kill, forcing termination.");
-                    TerminateExistingPresentMonProcesses();
+                    await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -444,11 +553,11 @@ namespace InfoPanel.IPFPS
             catch (Exception ex)
             {
                 Console.WriteLine($"Error stopping PresentMon: {ex.Message}");
-                TerminateExistingPresentMonProcesses();
+                await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {
-                _presentMonProcess.Dispose();
+                _presentMonProcess?.Dispose();
                 _presentMonProcess = null;
                 _isMonitoring = false;
                 ResetSensors();
@@ -458,41 +567,9 @@ namespace InfoPanel.IPFPS
             if (!string.IsNullOrEmpty(_currentSessionName))
             {
                 Console.WriteLine($"Stopping ETW session: {_currentSessionName}");
-                ExecuteCommand("logman.exe", $"stop {_currentSessionName} -ets", 1000, true);
+                await ExecuteCommandAsync("logman.exe", $"stop {_currentSessionName} -ets", 1000, true, cancellationToken).ConfigureAwait(false);
                 _currentSessionName = null;
             }
-        }
-
-        private void TerminateExistingPresentMonProcesses()
-        {
-            foreach (var process in Process.GetProcessesByName(PresentMonAppName))
-            {
-                try
-                {
-                    process.Kill(true);
-                    process.WaitForExit(1000);
-                    Console.WriteLine($"Terminated PresentMon PID: {process.Id}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Failed to terminate PresentMon PID {process.Id}: {ex.Message}");
-                }
-            }
-
-            foreach (var process in Process.GetProcessesByName(PresentMonServiceAppName))
-            {
-                try
-                {
-                    process.Kill(true);
-                    process.WaitForExit(1000);
-                    Console.WriteLine($"Terminated PresentMonService PID: {process.Id}");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Failed to terminate PresentMonService PID {process.Id}: {ex.Message}");
-                }
-            }
-            Console.WriteLine("Existing PresentMon processes terminated.");
         }
 
         private void ResetSensors()
@@ -502,46 +579,6 @@ namespace InfoPanel.IPFPS
             _frameTimeSum = 0;
             _frameCount = 0;
             Console.WriteLine("Sensors reset.");
-        }
-
-        private void ExecuteCommand(string fileName, string arguments, int timeoutMs, bool logOutput)
-        {
-            try
-            {
-                using (var proc = new Process
-                {
-                    StartInfo = new ProcessStartInfo
-                    {
-                        FileName = fileName,
-                        Arguments = arguments,
-                        CreateNoWindow = true,
-                        UseShellExecute = false,
-                        RedirectStandardOutput = logOutput,
-                        RedirectStandardError = logOutput
-                    }
-                })
-                {
-                    proc.Start();
-                    if (logOutput)
-                    {
-                        string output = proc.StandardOutput.ReadToEnd();
-                        string error = proc.StandardError.ReadToEnd();
-                        proc.WaitForExit(timeoutMs);
-                        if (proc.ExitCode == 0)
-                            Console.WriteLine($"{fileName} {arguments}: {output}");
-                        else
-                            Console.WriteLine($"{fileName} {arguments} failed: {error}");
-                    }
-                    else
-                    {
-                        proc.WaitForExit(timeoutMs);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to execute {fileName} {arguments}: {ex.Message}");
-            }
         }
 
         private bool ProcessExists(uint pid)
@@ -628,20 +665,20 @@ namespace InfoPanel.IPFPS
 
         public override void Close() => Dispose();
 
-        private void Cleanup()
+        private async Task CleanupAsync(CancellationToken cancellationToken)
         {
             if (_isMonitoring || _presentMonProcess != null)
             {
                 Console.WriteLine("Forcing capture cleanup in Dispose...");
-                StopCapture();
+                await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
             }
             if (_serviceRunning)
             {
                 Console.WriteLine("Ensuring service shutdown...");
-                StopPresentMonService();
+                await StopPresentMonServiceAsync(cancellationToken).ConfigureAwait(false);
             }
-            TerminateExistingPresentMonProcesses();
-            ClearETWSessions();
+            await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
+            await ClearETWSessionsAsync(cancellationToken).ConfigureAwait(false);
         }
 
         public void Dispose()
@@ -671,7 +708,7 @@ namespace InfoPanel.IPFPS
             }
             finally
             {
-                Cleanup();
+                CleanupAsync(CancellationToken.None).GetAwaiter().GetResult(); // Synchronous call for Dispose
                 _cts?.Dispose();
                 _cts = null;
                 _monitoringTask = null;
@@ -697,104 +734,107 @@ namespace InfoPanel.IPFPS
 
         private delegate bool EnumWindowsProc(HWND hWnd, IntPtr lParam);
 
-        private uint GetActiveFullscreenProcessId()
+    private uint GetActiveFullscreenProcessId()
+    {
+        uint fullscreenPid = 0;
+        HWND foregroundWindow = User32.GetForegroundWindow();
+
+        EnumWindows((hWnd, lParam) =>
         {
-            uint fullscreenPid = 0;
-            HWND foregroundWindow = User32.GetForegroundWindow();
-
-            EnumWindows((hWnd, lParam) =>
-            {
-                if (!User32.IsWindowVisible(hWnd))
-                    return true;
-
-                if (!User32.GetWindowRect(hWnd, out Vanara.PInvoke.RECT windowRect))
-                {
-                    Console.WriteLine($"Failed to get window rect for HWND {hWnd}.");
-                    return true;
-                }
-
-                HMONITOR hMonitor = User32.MonitorFromWindow(hWnd, User32.MonitorFlags.MONITOR_DEFAULTTONEAREST);
-                if (hMonitor == IntPtr.Zero)
-                {
-                    Console.WriteLine($"No monitor found for HWND {hWnd}.");
-                    return true;
-                }
-
-                var monitorInfo = new User32.MONITORINFO { cbSize = (uint)Marshal.SizeOf<User32.MONITORINFO>() };
-                if (!User32.GetMonitorInfo(hMonitor, ref monitorInfo))
-                {
-                    Console.WriteLine($"Failed to get monitor info for HWND {hWnd}.");
-                    return true;
-                }
-
-                if (!GetClientRect(hWnd, out Vanara.PInvoke.RECT clientRect))
-                {
-                    Console.WriteLine($"Failed to get client rect for HWND {hWnd}.");
-                    return true;
-                }
-
-                Vanara.PInvoke.POINT topLeft = new Vanara.PInvoke.POINT { X = clientRect.Left, Y = clientRect.Top };
-                Vanara.PInvoke.POINT bottomRight = new Vanara.PInvoke.POINT { X = clientRect.Right, Y = clientRect.Bottom };
-                User32.ClientToScreen(hWnd, ref topLeft);
-                User32.ClientToScreen(hWnd, ref bottomRight);
-                Vanara.PInvoke.RECT clientScreenRect = new Vanara.PInvoke.RECT
-                {
-                    Left = topLeft.X,
-                    Top = topLeft.Y,
-                    Right = bottomRight.X,
-                    Bottom = bottomRight.Y
-                };
-
-                int clientArea = (clientScreenRect.Right - clientScreenRect.Left) * (clientScreenRect.Bottom - clientScreenRect.Top);
-                int monitorArea = (monitorInfo.rcMonitor.Right - monitorInfo.rcMonitor.Left) * (monitorInfo.rcMonitor.Bottom - monitorInfo.rcMonitor.Top);
-                float areaMatch = (float)clientArea / monitorArea;
-
-                uint style = GetWindowLong(hWnd, GWL_STYLE);
-                bool hasCaptionOrBorders = (style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0;
-
-                bool isFullscreen = clientScreenRect.Equals(monitorInfo.rcMonitor);
-                bool isBorderlessCandidate = areaMatch >= 0.98f && hWnd == foregroundWindow && !hasCaptionOrBorders;
-
-                if (clientArea < 1000 || clientScreenRect.Left < monitorInfo.rcMonitor.Left - 100 || clientScreenRect.Top < monitorInfo.rcMonitor.Top - 100)
-                    return true;
-
-                StringBuilder className = new StringBuilder(256);
-                int classLength = GetClassName(hWnd, className, className.Capacity);
-                string windowClass = classLength > 0 ? className.ToString().ToLower() : "unknown";
-
-                User32.GetWindowThreadProcessId(hWnd, out uint pid);
-                string processName = "unknown";
-                try
-                {
-                    var proc = Process.GetProcessById((int)pid);
-                    processName = proc.ProcessName.ToLower();
-
-                    if (IsSystemUIWindow(processName, windowClass))
-                    {
-                        Console.WriteLine($"Skipping system UI window: {processName} ({windowClass})");
-                        return true;
-                    }
-                }
-                catch (ArgumentException)
-                {
-                    Console.WriteLine($"PID {pid} no longer valid.");
-                    return true;
-                }
-
-                Console.WriteLine($"Window HWND: {hWnd}, PID: {pid}, Class: {windowClass}, Process: {processName}, ClientRect: {clientScreenRect}, Monitor: {monitorInfo.rcMonitor}, Fullscreen: {isFullscreen}, AreaMatch: {areaMatch:F2}, HasCaptionOrBorders: {hasCaptionOrBorders}");
-
-                if ((isFullscreen || isBorderlessCandidate) && pid > 4 && pid != _selfPid)
-                {
-                    fullscreenPid = pid;
-                    Console.WriteLine($"Detected potential game: {processName} ({windowClass}), Fullscreen: {isFullscreen}, Borderless: {isBorderlessCandidate}");
-                    return false;
-                }
-
+            if (!User32.IsWindowVisible(hWnd))
                 return true;
-            }, IntPtr.Zero);
 
-            return fullscreenPid;
-        }
+            if (!User32.GetWindowRect(hWnd, out Vanara.PInvoke.RECT windowRect))
+            {
+                Console.WriteLine($"Failed to get window rect for HWND {hWnd}.");
+                return true;
+            }
+
+            HMONITOR hMonitor = User32.MonitorFromWindow(hWnd, User32.MonitorFlags.MONITOR_DEFAULTTONEAREST);
+            if (hMonitor == IntPtr.Zero)
+            {
+                Console.WriteLine($"No monitor found for HWND {hWnd}.");
+                return true;
+            }
+
+            var monitorInfo = new User32.MONITORINFO { cbSize = (uint)Marshal.SizeOf<User32.MONITORINFO>() };
+            if (!User32.GetMonitorInfo(hMonitor, ref monitorInfo))
+            {
+                Console.WriteLine($"Failed to get monitor info for HWND {hWnd}.");
+                return true;
+            }
+
+            if (!GetClientRect(hWnd, out Vanara.PInvoke.RECT clientRect))
+            {
+                Console.WriteLine($"Failed to get client rect for HWND {hWnd}.");
+                return true;
+            }
+
+            Vanara.PInvoke.POINT topLeft = new Vanara.PInvoke.POINT { X = clientRect.Left, Y = clientRect.Top };
+            Vanara.PInvoke.POINT bottomRight = new Vanara.PInvoke.POINT { X = clientRect.Right, Y = clientRect.Bottom };
+            User32.ClientToScreen(hWnd, ref topLeft);
+            User32.ClientToScreen(hWnd, ref bottomRight);
+            Vanara.PInvoke.RECT clientScreenRect = new Vanara.PInvoke.RECT
+            {
+                Left = topLeft.X,
+                Top = topLeft.Y,
+                Right = bottomRight.X,
+                Bottom = bottomRight.Y
+            };
+
+            int clientArea = (clientScreenRect.Right - clientScreenRect.Left) * (clientScreenRect.Bottom - clientScreenRect.Top);
+            int monitorArea = (monitorInfo.rcMonitor.Right - monitorInfo.rcMonitor.Left) * (monitorInfo.rcMonitor.Bottom - monitorInfo.rcMonitor.Top);
+            float areaMatch = (float)clientArea / monitorArea;
+
+            uint style = GetWindowLong(hWnd, GWL_STYLE);
+            bool hasCaptionOrBorders = (style & WS_CAPTION) != 0 || (style & WS_THICKFRAME) != 0;
+            bool isMaximized = User32.IsZoomed(hWnd); // Check if window is maximized
+
+            bool isFullscreen = clientScreenRect.Equals(monitorInfo.rcMonitor) && !hasCaptionOrBorders; // True fullscreen requires no captions/borders
+            bool isBorderlessCandidate = areaMatch >= 0.98f && hWnd == foregroundWindow && !hasCaptionOrBorders && !isMaximized;
+
+            // Skip small or off-screen windows
+            if (clientArea < 1000 || clientScreenRect.Left < monitorInfo.rcMonitor.Left - 100 || clientScreenRect.Top < monitorInfo.rcMonitor.Top - 100)
+                return true;
+
+            StringBuilder className = new StringBuilder(256);
+            int classLength = GetClassName(hWnd, className, className.Capacity);
+            string windowClass = classLength > 0 ? className.ToString().ToLower() : "unknown";
+
+            User32.GetWindowThreadProcessId(hWnd, out uint pid);
+            string processName = "unknown";
+            try
+            {
+                var proc = Process.GetProcessById((int)pid);
+                processName = proc.ProcessName.ToLower();
+
+                if (IsSystemUIWindow(processName, windowClass))
+                {
+                    Console.WriteLine($"Skipping system UI window: {processName} ({windowClass})");
+                    return true;
+                }
+            }
+            catch (ArgumentException)
+            {
+                Console.WriteLine($"PID {pid} no longer valid.");
+                return true;
+            }
+
+            Console.WriteLine($"Window HWND: {hWnd}, PID: {pid}, Class: {windowClass}, Process: {processName}, ClientRect: {clientScreenRect}, Monitor: {monitorInfo.rcMonitor}, Fullscreen: {isFullscreen}, AreaMatch: {areaMatch:F2}, HasCaptionOrBorders: {hasCaptionOrBorders}, IsMaximized: {isMaximized}");
+
+            // Only detect true fullscreen or borderless fullscreen windows
+            if ((isFullscreen || isBorderlessCandidate) && pid > 4 && pid != _selfPid)
+            {
+                fullscreenPid = pid;
+                Console.WriteLine($"Detected potential game: {processName} ({windowClass}), Fullscreen: {isFullscreen}, Borderless: {isBorderlessCandidate}");
+                return false; // Stop enumeration
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return fullscreenPid;
+    }
 
         private bool IsSystemUIWindow(string processName, string windowClass)
         {
