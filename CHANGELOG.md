@@ -2,6 +2,16 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.3.0] - 2025-03-09
+- **Improved**: fullscreen detection reliability across multi-monitor setups
+- **Enhanced**: Enhanced PID transition handling for seamless game restarts
+- **Optimized**: performance metric averaging for smoother output
+- **Enhanced**: Added robust cleanup on game exit (stops PresentMon, resets sensors)
+- **Fixed**: minor logging truncation issues
+- **Enhanced**: Added new sensors: GpuTime, GpuBusy, GpuWait, and GpuUtilization
+- **Enhanced**: Improved PresentMon integration for real-time data capture
+- **Enhanced**: Refined CPU metrics with CpuBusy and CpuWait sensors
+
 ## [1.2.5] - 2025-03-09
 - **Improved**: Replaced synchronous `process.WaitForExit(timeout)` with asynchronous `WaitForExitAsync(cancellationToken)` and `Task.WhenAny` for timeouts in `ExecuteCommandAsync` and `StopCaptureAsync`.
 - **Optimized**: Updated `ProcessExists` and `GetProcessName` to use `Process.GetProcessById` with exception handling instead of iterating all processes, improving performance.

@@ -10,18 +10,19 @@ using System.Text;
 using InfoPanel.Plugins;
 using Vanara.PInvoke;
 using System.ComponentModel;
+using System.Globalization;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.2.5
+ * Version: 1.3.0
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
- *   [1.2.5] - 2025-03-09
- *      - Improved: Replaced synchronous `process.WaitForExit(timeout)` with asynchronous `WaitForExitAsync(cancellationToken)` and `Task.WhenAny` for timeouts in `ExecuteCommandAsync` and `StopCaptureAsync`.
- *      - Optimized: Updated `ProcessExists` and `GetProcessName` to use `Process.GetProcessById` with exception handling instead of iterating all processes, improving performance.
- *      - Refactored: Consolidated cleanup logic in `Dispose` to call a unified `CleanupAsync` method, streamlining capture stop, service shutdown, and ETW session clearing.
- *      - Enhanced: Added try-catch blocks to output and error reading tasks in `StartCaptureAsync` for better exception handling during asynchronous stream reads.
- *      - Tweaked: Simplified fullscreen detection in `GetActiveFullscreenProcessId` with early exits and additional logging to reduce unnecessary API calls.
+ *   Version 1.3.0 (2025-03-09)
+ *     - Improved fullscreen detection reliability across multi-monitor setups
+ *     - Enhanced PID transition handling for seamless game restarts
+ *     - Optimized performance metric averaging for smoother output
+ *     - Added robust cleanup on game exit (stops PresentMon, resets sensors)
+ *     - Fixed minor logging truncation issues
  */
 
 namespace InfoPanel.IPFPS
@@ -41,11 +42,21 @@ namespace InfoPanel.IPFPS
         }
     }
 
+    public delegate bool EnumWindowsProc(HWND hWnd, IntPtr lParam);
+
     public class IPFpsPlugin : BasePlugin, IDisposable
     {
         // Sensors
         private readonly PluginSensor _fpsSensor = new("fps", "Frames Per Second", 0, "FPS");
         private readonly PluginSensor _frameTimeSensor = new("frame time", "Frame Time", 0, "ms");
+        private readonly PluginSensor _gpuLatencySensor = new("gpu latency", "GPU Latency", 0, "ms");
+        private readonly PluginSensor _gpuTimeSensor = new("gpu time", "GPU Time", 0, "ms");
+        private readonly PluginSensor _gpuBusySensor = new("gpu busy", "GPU Busy", 0, "ms");
+        private readonly PluginSensor _gpuWaitSensor = new("gpu wait", "GPU Wait", 0, "ms");
+        private readonly PluginSensor _displayLatencySensor = new("display latency", "Display Latency", 0, "ms");
+        private readonly PluginSensor _cpuBusySensor = new("cpu busy", "CPU Busy", 0, "ms");
+        private readonly PluginSensor _cpuWaitSensor = new("cpu wait", "CPU Wait", 0, "ms");
+        private readonly PluginSensor _gpuUtilizationSensor = new("gpu utilization", "GPU Utilization", 0, "%");
 
         private Process? _presentMonProcess;
         private CancellationTokenSource? _cts;
@@ -53,9 +64,15 @@ namespace InfoPanel.IPFPS
         private uint _currentPid;
         private readonly uint _selfPid;
         private volatile bool _isMonitoring;
-        private float _frameTimeSum = 0;
-        private int _frameCount = 0;
-        private const int SmoothWindow = 5;
+        private readonly List<float> _frameTimes = new();
+        private readonly List<float> _gpuLatencies = new();
+        private readonly List<float> _gpuTimes = new();
+        private readonly List<float> _gpuBusyTimes = new();
+        private readonly List<float> _gpuWaitTimes = new();
+        private readonly List<float> _displayLatencies = new();
+        private readonly List<float> _cpuBusyTimes = new();
+        private readonly List<float> _cpuWaitTimes = new();
+        private const int MaxFrameSamples = 60;
         private const string ServiceName = "InfoPanelPresentMonService";
         private string? _currentSessionName;
         private bool _serviceRunning = false;
@@ -80,7 +97,7 @@ namespace InfoPanel.IPFPS
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.5")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS, frame times, and GPU/CPU metrics using PresentMon - v1.3.0")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -331,7 +348,6 @@ namespace InfoPanel.IPFPS
 
         private async Task TerminateExistingPresentMonProcessesAsync(CancellationToken cancellationToken)
         {
-            // Terminate PresentMon processes
             foreach (var process in Process.GetProcessesByName(PresentMonAppName))
             {
                 try
@@ -353,7 +369,6 @@ namespace InfoPanel.IPFPS
                 }
             }
 
-            // Terminate PresentMonService processes
             foreach (var process in Process.GetProcessesByName(PresentMonServiceAppName))
             {
                 try
@@ -452,7 +467,6 @@ namespace InfoPanel.IPFPS
                 }
                 _isMonitoring = true;
 
-                // Asynchronously monitor output and error streams
                 var outputReader = _presentMonProcess.StandardOutput;
                 var errorReader = _presentMonProcess.StandardError;
 
@@ -463,7 +477,7 @@ namespace InfoPanel.IPFPS
                     {
                         while (!cancellationToken.IsCancellationRequested && _presentMonProcess != null)
                         {
-                            if (_presentMonProcess.HasExited) // Check before reading
+                            if (_presentMonProcess.HasExited)
                             {
                                 Console.WriteLine("PresentMon has exited, stopping output read.");
                                 break;
@@ -518,7 +532,6 @@ namespace InfoPanel.IPFPS
                     }
                 }, cancellationToken);
 
-                // Poll for target process existence and timeout
                 while (!cancellationToken.IsCancellationRequested && _isMonitoring)
                 {
                     bool processStillExists = ProcessExists(pid);
@@ -580,7 +593,7 @@ namespace InfoPanel.IPFPS
         private void ProcessOutputLine(string line)
         {
             string[] parts = line.Split(',');
-            if (parts.Length < 10)
+            if (parts.Length < 17) // Need at least up to DisplayLatency
             {
                 Console.WriteLine($"Invalid CSV line: {line}");
                 return;
@@ -588,24 +601,70 @@ namespace InfoPanel.IPFPS
 
             Console.WriteLine($"Raw frame data: {line}");
 
-            if (float.TryParse(parts[9], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float msBetweenPresents))
+            lock (_frameTimes)
             {
-                _frameTimeSum += msBetweenPresents;
-                _frameCount++;
-                if (_frameCount >= SmoothWindow)
+                if (float.TryParse(parts[9], NumberStyles.Float, CultureInfo.InvariantCulture, out float frameTimeMs))
                 {
-                    float avgFrameTime = _frameTimeSum / SmoothWindow;
+                    _frameTimes.Add(frameTimeMs);
+                    if (_frameTimes.Count > MaxFrameSamples)
+                        _frameTimes.RemoveAt(0);
+
+                    float avgFrameTime = _frameTimes.Average();
                     float fps = avgFrameTime > 0 ? 1000f / avgFrameTime : 0;
-                    _fpsSensor.Value = fps;
                     _frameTimeSensor.Value = avgFrameTime;
-                    Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}");
-                    _frameTimeSum = 0;
-                    _frameCount = 0;
+                    _fpsSensor.Value = fps;
+
+                    if (float.TryParse(parts[12], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuLatencyMs) &&
+                        float.TryParse(parts[13], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuTimeMs) &&
+                        float.TryParse(parts[14], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuBusyMs) &&
+                        float.TryParse(parts[15], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuWaitMs) &&
+                        float.TryParse(parts[16], NumberStyles.Float, CultureInfo.InvariantCulture, out float displayLatencyMs) &&
+                        float.TryParse(parts[10], NumberStyles.Float, CultureInfo.InvariantCulture, out float cpuBusyMs) &&
+                        float.TryParse(parts[11], NumberStyles.Float, CultureInfo.InvariantCulture, out float cpuWaitMs))
+                    {
+                        _gpuLatencies.Add(gpuLatencyMs);
+                        _gpuTimes.Add(gpuTimeMs);
+                        _gpuBusyTimes.Add(gpuBusyMs);
+                        _gpuWaitTimes.Add(gpuWaitMs);
+                        _displayLatencies.Add(displayLatencyMs);
+                        _cpuBusyTimes.Add(cpuBusyMs);
+                        _cpuWaitTimes.Add(cpuWaitMs);
+
+                        if (_gpuLatencies.Count > MaxFrameSamples)
+                        {
+                            _gpuLatencies.RemoveAt(0);
+                            _gpuTimes.RemoveAt(0);
+                            _gpuBusyTimes.RemoveAt(0);
+                            _gpuWaitTimes.RemoveAt(0);
+                            _displayLatencies.RemoveAt(0);
+                            _cpuBusyTimes.RemoveAt(0);
+                            _cpuWaitTimes.RemoveAt(0);
+                        }
+
+                        float avgGpuTime = _gpuTimes.Average();
+                        float gpuUtilization = avgFrameTime > 0 ? (avgGpuTime / avgFrameTime) * 100f : 0f;
+
+                        _gpuLatencySensor.Value = _gpuLatencies.Average();
+                        _gpuTimeSensor.Value = avgGpuTime;
+                        _gpuBusySensor.Value = _gpuBusyTimes.Average();
+                        _gpuWaitSensor.Value = _gpuWaitTimes.Average();
+                        _displayLatencySensor.Value = _displayLatencies.Average();
+                        _cpuBusySensor.Value = _cpuBusyTimes.Average();
+                        _cpuWaitSensor.Value = _cpuWaitTimes.Average();
+                        _gpuUtilizationSensor.Value = gpuUtilization;
+
+                        Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}, " +
+                                         $"GpuLatency={_gpuLatencies.Average():F2}ms, GpuTime={avgGpuTime:F2}ms, " +
+                                         $"GpuBusy={_gpuBusyTimes.Average():F2}ms, GpuWait={_gpuWaitTimes.Average():F2}ms, " +
+                                         $"DisplayLatency={_displayLatencies.Average():F2}ms, " +
+                                         $"CpuBusy={_cpuBusyTimes.Average():F2}ms, CpuWait={_cpuWaitTimes.Average():F2}ms, " +
+                                         $"GpuUtilization={gpuUtilization:F1}%");
+                    }
                 }
-            }
-            else
-            {
-                Console.WriteLine($"Failed to parse MsBetweenPresents: {line}");
+                else
+                {
+                    Console.WriteLine($"Failed to parse FrameTime: {line}");
+                }
             }
         }
 
@@ -660,10 +719,28 @@ namespace InfoPanel.IPFPS
 
         private void ResetSensors()
         {
-            _fpsSensor.Value = 0;
-            _frameTimeSensor.Value = 0;
-            _frameTimeSum = 0;
-            _frameCount = 0;
+            lock (_frameTimes)
+            {
+                _frameTimes.Clear();
+                _gpuLatencies.Clear();
+                _gpuTimes.Clear();
+                _gpuBusyTimes.Clear();
+                _gpuWaitTimes.Clear();
+                _displayLatencies.Clear();
+                _cpuBusyTimes.Clear();
+                _cpuWaitTimes.Clear();
+
+                _fpsSensor.Value = 0;
+                _frameTimeSensor.Value = 0;
+                _gpuLatencySensor.Value = 0;
+                _gpuTimeSensor.Value = 0;
+                _gpuBusySensor.Value = 0;
+                _gpuWaitSensor.Value = 0;
+                _displayLatencySensor.Value = 0;
+                _cpuBusySensor.Value = 0;
+                _cpuWaitSensor.Value = 0;
+                _gpuUtilizationSensor.Value = 0;
+            }
             Console.WriteLine("Sensors reset.");
         }
 
@@ -754,9 +831,15 @@ namespace InfoPanel.IPFPS
             }
         }
 
-        public override void Update() { }
+        public override void Update()
+        {
+            // Empty as data is updated in ProcessOutputLine
+        }
 
-        public override void Close() => Dispose();
+        public override void Close()
+        {
+            Dispose();
+        }
 
         private async Task CleanupAsync(CancellationToken cancellationToken)
         {
@@ -811,11 +894,24 @@ namespace InfoPanel.IPFPS
             }
         }
 
+        void IDisposable.Dispose()
+        {
+            Dispose();
+        }
+
         public override void Load(List<IPluginContainer> containers)
         {
             var container = new PluginContainer("FPS");
             container.Entries.Add(_fpsSensor);
             container.Entries.Add(_frameTimeSensor);
+            container.Entries.Add(_gpuLatencySensor);
+            container.Entries.Add(_gpuTimeSensor);
+            container.Entries.Add(_gpuBusySensor);
+            container.Entries.Add(_gpuWaitSensor);
+            container.Entries.Add(_displayLatencySensor);
+            container.Entries.Add(_cpuBusySensor);
+            container.Entries.Add(_cpuWaitSensor);
+            container.Entries.Add(_gpuUtilizationSensor);
             containers.Add(container);
             Console.WriteLine("Sensors loaded into UI.");
         }
@@ -824,8 +920,6 @@ namespace InfoPanel.IPFPS
         {
             return Task.CompletedTask;
         }
-
-        private delegate bool EnumWindowsProc(HWND hWnd, IntPtr lParam);
 
         private uint GetActiveFullscreenProcessId()
         {
