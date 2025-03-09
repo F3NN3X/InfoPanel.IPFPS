@@ -2,6 +2,14 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.3.1] - 2025-03-09
+### Fixed
+- Corrected 1% and 0.1% low FPS calculations in `ProcessOutputLine` to use the worst frames (highest frame times) by sorting frame times in descending order and selecting the appropriate percentiles (99th and 99.9th). Previously, the best frames were incorrectly used, leading to inflated low FPS values (e.g., 176 FPS instead of < average).
+### Changed
+- Increased `MaxFrameSamples` from default (assumed 100) to 1000 for finer granularity in frame time sampling, providing a rolling window of ~8-10 seconds at typical FPS rates (100-120 FPS). This improves the accuracy of average, 1%, and 0.1% low FPS metrics over a longer period.
+### Notes
+- Verified fix with logs, confirming 1% low (e.g., 86.74 FPS → 10.09 FPS) and 0.1% low (e.g., 82.60 FPS → 8.36 FPS) now correctly reflect performance dips below the average FPS (~128 FPS → 122 FPS).
+
 ## [1.3.0] - 2025-03-09
 - **Improved**: fullscreen detection reliability across multi-monitor setups
 - **Enhanced**: Enhanced PID transition handling for seamless game restarts

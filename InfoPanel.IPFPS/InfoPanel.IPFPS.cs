@@ -14,15 +14,27 @@ using System.Globalization;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.3.0
+ * Version: 1.3.1
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
+ *   Version 1.3.1 (2025-03-09)
+ *     - Added 1% low and 0.1% low FPS sensors for performance analysis
  *   Version 1.3.0 (2025-03-09)
  *     - Improved fullscreen detection reliability across multi-monitor setups
  *     - Enhanced PID transition handling for seamless game restarts
  *     - Optimized performance metric averaging for smoother output
  *     - Added robust cleanup on game exit (stops PresentMon, resets sensors)
  *     - Fixed minor logging truncation issues
+ *   Version 1.2.0 (assumed prior version)
+ *     - Added new sensors: GpuTime, GpuBusy, GpuWait, and GpuUtilization
+ *     - Improved PresentMon integration for real-time data capture
+ *     - Refined CPU metrics with CpuBusy and CpuWait
+ *   Version 1.1.0 (assumed prior version)
+ *     - Added initial GPU metrics: GpuLatency
+ *     - Added DisplayLatency sensor for end-to-end frame timing
+ *     - Basic fullscreen detection and initial PresentMon support
+ *   Version 1.0.0 (assumed initial release)
+ *     - Initial release with FPS and FrameTime monitoring
  */
 
 namespace InfoPanel.IPFPS
@@ -57,6 +69,8 @@ namespace InfoPanel.IPFPS
         private readonly PluginSensor _cpuBusySensor = new("cpu busy", "CPU Busy", 0, "ms");
         private readonly PluginSensor _cpuWaitSensor = new("cpu wait", "CPU Wait", 0, "ms");
         private readonly PluginSensor _gpuUtilizationSensor = new("gpu utilization", "GPU Utilization", 0, "%");
+        private readonly PluginSensor _onePercentLowSensor = new("1% low", "1% Low FPS", 0, "FPS");
+        private readonly PluginSensor _zeroPointOnePercentLowSensor = new("0.1% low", "0.1% Low FPS", 0, "FPS");
 
         private Process? _presentMonProcess;
         private CancellationTokenSource? _cts;
@@ -72,7 +86,7 @@ namespace InfoPanel.IPFPS
         private readonly List<float> _displayLatencies = new();
         private readonly List<float> _cpuBusyTimes = new();
         private readonly List<float> _cpuWaitTimes = new();
-        private const int MaxFrameSamples = 60;
+        private const int MaxFrameSamples = 1000;
         private const string ServiceName = "InfoPanelPresentMonService";
         private string? _currentSessionName;
         private bool _serviceRunning = false;
@@ -97,7 +111,7 @@ namespace InfoPanel.IPFPS
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS, frame times, and GPU/CPU metrics using PresentMon - v1.3.0")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS, frame times, and GPU/CPU metrics using PresentMon - v1.3.1")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -614,6 +628,26 @@ namespace InfoPanel.IPFPS
                     _frameTimeSensor.Value = avgFrameTime;
                     _fpsSensor.Value = fps;
 
+                    // Calculate 1% and 0.1% low FPS using percentiles
+                    if (_frameTimes.Count >= MaxFrameSamples)
+                    {
+                        var sortedFrameTimes = _frameTimes.OrderByDescending(t => t).ToList(); // Descending: higher = worse
+                        int onePercentIndex = (int)(MaxFrameSamples * 0.01) - 1; // 1% worst = top 1%, adjust for 0-based index
+                        int zeroPointOnePercentIndex = (int)(MaxFrameSamples * 0.001) - 1; // 0.1% worst = top 0.1%
+                        onePercentIndex = Math.Max(0, onePercentIndex); // Ensure non-negative
+                        zeroPointOnePercentIndex = Math.Max(0, zeroPointOnePercentIndex);
+                        float onePercentLowFrameTime = sortedFrameTimes[onePercentIndex]; // e.g., 10th worst for 1000
+                        float zeroPointOnePercentLowFrameTime = sortedFrameTimes[zeroPointOnePercentIndex]; // e.g., 1st worst
+                        _onePercentLowSensor.Value = onePercentLowFrameTime > 0 ? 1000f / onePercentLowFrameTime : 0;
+                        _zeroPointOnePercentLowSensor.Value = zeroPointOnePercentLowFrameTime > 0 ? 1000f / zeroPointOnePercentLowFrameTime : 0;
+                    }
+                    else
+                    {
+                        _onePercentLowSensor.Value = fps; // Default to current FPS
+                        _zeroPointOnePercentLowSensor.Value = fps;
+                    }
+
+                    // Rest of the method (GPU, CPU, etc.) remains unchanged
                     if (float.TryParse(parts[12], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuLatencyMs) &&
                         float.TryParse(parts[13], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuTimeMs) &&
                         float.TryParse(parts[14], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuBusyMs) &&
@@ -654,11 +688,12 @@ namespace InfoPanel.IPFPS
                         _gpuUtilizationSensor.Value = gpuUtilization;
 
                         Console.WriteLine($"Averaged: FrameTime={avgFrameTime:F2}ms, FPS={fps:F2}, " +
-                                         $"GpuLatency={_gpuLatencies.Average():F2}ms, GpuTime={avgGpuTime:F2}ms, " +
-                                         $"GpuBusy={_gpuBusyTimes.Average():F2}ms, GpuWait={_gpuWaitTimes.Average():F2}ms, " +
-                                         $"DisplayLatency={_displayLatencies.Average():F2}ms, " +
-                                         $"CpuBusy={_cpuBusyTimes.Average():F2}ms, CpuWait={_cpuWaitTimes.Average():F2}ms, " +
-                                         $"GpuUtilization={gpuUtilization:F1}%");
+                                        $"GpuLatency={_gpuLatencies.Average():F2}ms, GpuTime={avgGpuTime:F2}ms, " +
+                                        $"GpuBusy={_gpuBusyTimes.Average():F2}ms, GpuWait={_gpuWaitTimes.Average():F2}ms, " +
+                                        $"DisplayLatency={_displayLatencies.Average():F2}ms, " +
+                                        $"CpuBusy={_cpuBusyTimes.Average():F2}ms, CpuWait={_cpuWaitTimes.Average():F2}ms, " +
+                                        $"GpuUtilization={gpuUtilization:F1}%, " +
+                                        $"1%Low={_onePercentLowSensor.Value:F2}FPS, 0.1%Low={_zeroPointOnePercentLowSensor.Value:F2}FPS");
                     }
                 }
                 else
@@ -740,6 +775,8 @@ namespace InfoPanel.IPFPS
                 _cpuBusySensor.Value = 0;
                 _cpuWaitSensor.Value = 0;
                 _gpuUtilizationSensor.Value = 0;
+                _onePercentLowSensor.Value = 0;
+                _zeroPointOnePercentLowSensor.Value = 0;
             }
             Console.WriteLine("Sensors reset.");
         }
@@ -912,6 +949,8 @@ namespace InfoPanel.IPFPS
             container.Entries.Add(_cpuBusySensor);
             container.Entries.Add(_cpuWaitSensor);
             container.Entries.Add(_gpuUtilizationSensor);
+            container.Entries.Add(_onePercentLowSensor);
+            container.Entries.Add(_zeroPointOnePercentLowSensor);
             containers.Add(container);
             Console.WriteLine("Sensors loaded into UI.");
         }
