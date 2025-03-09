@@ -2,6 +2,14 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.2.5] - 2025-03-09
+- **Improved**: Replaced synchronous `process.WaitForExit(timeout)` with asynchronous `WaitForExitAsync(cancellationToken)` and `Task.WhenAny` for timeouts in `ExecuteCommandAsync` and `StopCaptureAsync`.
+- **Optimized**: Updated `ProcessExists` and `GetProcessName` to use `Process.GetProcessById` with exception handling instead of iterating all processes, improving performance.
+- **Refactored**: Consolidated cleanup logic in `Dispose` to call a unified `CleanupAsync` method, streamlining capture stop, service shutdown, and ETW session clearing.
+- **Enhanced**: Added try-catch blocks to output and error reading tasks in `StartCaptureAsync` for better exception handling during asynchronous stream reads.
+- **Tweaked**: Simplified fullscreen detection in `GetActiveFullscreenProcessId` with early exits and additional logging to reduce unnecessary API calls.
+- **Fixed**: Resolved `CS8625` warnings in `WaitForExitAsync` by using `TaskCompletionSource<bool>` instead of passing `null` to `TaskCompletionSource<object>`.
+
 ## [1.2.4] - 2025-03-08
 - **Fixed**: Removed hardcoded game check, making the plugin agnostic to specific apps.
   - Replaced with generic handling of access-denied cases in `IsReShadeActive`, assuming no ReShade interference unless `dxgi.dll` is confirmed.

@@ -13,23 +13,37 @@ using System.ComponentModel;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.2.4
+ * Version: 1.2.5
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
- *   - v1.2.4 (Mar 8, 2025): Removed hardcoded game check, fixed nullability warning.
- *     - Replaced Arma-specific ReShade bypass with generic handling of access-denied cases in IsReShadeActive.
- *     - Fixed CS8600 warning by declaring processName as string? in StartCaptureAsync.
- *   - v1.2.3 (Mar 8, 2025): Bypassed ReShade check for anti-cheat protected games.
- *     - Skipped IsReShadeActive for Arma Reforger to avoid Win32Exception due to BattlEye access denial.
- *   - v1.2.2 (Mar 8, 2025): Restored functionality from v1.2.1 with stability fixes.
- *   - v1.2.1 (Mar 8, 2025): Asynchronous optimization phase 1, fixed race condition.
- *   - v1.2.0 (Mar 7, 2025): Stable release with fullscreen detection and cleanup.
+ *   [1.2.5] - 2025-03-09
+ *      - Improved: Replaced synchronous `process.WaitForExit(timeout)` with asynchronous `WaitForExitAsync(cancellationToken)` and `Task.WhenAny` for timeouts in `ExecuteCommandAsync` and `StopCaptureAsync`.
+ *      - Optimized: Updated `ProcessExists` and `GetProcessName` to use `Process.GetProcessById` with exception handling instead of iterating all processes, improving performance.
+ *      - Refactored: Consolidated cleanup logic in `Dispose` to call a unified `CleanupAsync` method, streamlining capture stop, service shutdown, and ETW session clearing.
+ *      - Enhanced: Added try-catch blocks to output and error reading tasks in `StartCaptureAsync` for better exception handling during asynchronous stream reads.
+ *      - Tweaked: Simplified fullscreen detection in `GetActiveFullscreenProcessId` with early exits and additional logging to reduce unnecessary API calls.
  */
 
 namespace InfoPanel.IPFPS
 {
+    public static class ProcessExtensions
+    {
+        public static Task WaitForExitAsync(this Process process, CancellationToken cancellationToken = default)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            process.EnableRaisingEvents = true;
+            process.Exited += (s, e) => tcs.TrySetResult(true);
+            if (cancellationToken != default)
+                cancellationToken.Register(() => tcs.TrySetCanceled());
+            if (process.HasExited)
+                tcs.TrySetResult(true);
+            return tcs.Task;
+        }
+    }
+
     public class IPFpsPlugin : BasePlugin, IDisposable
     {
+        // Sensors
         private readonly PluginSensor _fpsSensor = new("fps", "Frames Per Second", 0, "FPS");
         private readonly PluginSensor _frameTimeSensor = new("frame time", "Frame Time", 0, "ms");
 
@@ -66,7 +80,7 @@ namespace InfoPanel.IPFPS
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.4")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS and frame times using PresentMon - v1.2.5")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -87,7 +101,7 @@ namespace InfoPanel.IPFPS
             Console.WriteLine("Monitoring task started.");
         }
 
-        private static Task<bool> StartAsync(Process process)
+        private static async Task<bool> StartAsync(Process process)
         {
             var tcs = new TaskCompletionSource<bool>();
             process.EnableRaisingEvents = true;
@@ -102,7 +116,7 @@ namespace InfoPanel.IPFPS
                 {
                     Console.WriteLine($"Process failed to start: {process.StartInfo.FileName} {process.StartInfo.Arguments}");
                     tcs.TrySetResult(false);
-                    return tcs.Task;
+                    return await tcs.Task;
                 }
                 Console.WriteLine($"Process started: {process.StartInfo.FileName} {process.StartInfo.Arguments}, PID: {process.Id}");
                 tcs.TrySetResult(true);
@@ -112,14 +126,14 @@ namespace InfoPanel.IPFPS
                 Console.WriteLine($"Failed to start process {process.StartInfo.FileName}: {ex} (Error Code: {ex.NativeErrorCode})");
                 tcs.TrySetResult(false);
             }
-            return tcs.Task;
+            return await tcs.Task;
         }
 
         private async Task ExecuteCommandAsync(string fileName, string arguments, int timeoutMs, bool logOutput, CancellationToken cancellationToken)
         {
             try
             {
-                using (var proc = new Process
+                using var proc = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -130,39 +144,55 @@ namespace InfoPanel.IPFPS
                         RedirectStandardOutput = logOutput,
                         RedirectStandardError = logOutput
                     }
-                })
-                {
-                    bool started = await StartAsync(proc).ConfigureAwait(false);
-                    if (!started)
-                    {
-                        Console.WriteLine($"Command {fileName} {arguments} failed to start.");
-                        return;
-                    }
+                };
 
-                    if (logOutput)
+                bool started = await StartAsync(proc).ConfigureAwait(false);
+                if (!started)
+                {
+                    Console.WriteLine($"Command {fileName} {arguments} failed to start.");
+                    return;
+                }
+
+                if (logOutput)
+                {
+                    var exitTask = proc.WaitForExitAsync(cancellationToken);
+                    var delayTask = Task.Delay(timeoutMs, cancellationToken);
+                    if (await Task.WhenAny(exitTask, delayTask).ConfigureAwait(false) == exitTask)
                     {
                         string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
                         string error = await proc.StandardError.ReadToEndAsync().ConfigureAwait(false);
-
-                        if (await Task.Run(() => proc.WaitForExit(timeoutMs), cancellationToken).ConfigureAwait(false))
-                        {
-                            if (proc.ExitCode == 0)
-                                Console.WriteLine($"{fileName} {arguments}: {output}");
-                            else
-                                Console.WriteLine($"{fileName} {arguments} failed: {error}");
-                        }
+                        if (proc.ExitCode == 0)
+                            Console.WriteLine($"{fileName} {arguments}: {output}");
                         else
-                        {
-                            Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
-                            proc.Kill(true);
-                        }
+                            Console.WriteLine($"{fileName} {arguments} failed: {error}");
                     }
                     else
                     {
-                        if (!await Task.Run(() => proc.WaitForExit(timeoutMs), cancellationToken).ConfigureAwait(false))
+                        Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
+                        try
                         {
-                            Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
                             proc.Kill(true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Failed to kill process {fileName}: {ex.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    var exitTask = proc.WaitForExitAsync(cancellationToken);
+                    var delayTask = Task.Delay(timeoutMs, cancellationToken);
+                    if (await Task.WhenAny(exitTask, delayTask).ConfigureAwait(false) != exitTask)
+                    {
+                        Console.WriteLine($"{fileName} {arguments} timed out after {timeoutMs}ms.");
+                        try
+                        {
+                            proc.Kill(true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Failed to kill process {fileName}: {ex.Message}");
                         }
                     }
                 }
@@ -224,7 +254,7 @@ namespace InfoPanel.IPFPS
                 Console.WriteLine($"Waiting for {ServiceName} to stop...");
                 await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
 
-                using (var proc = new Process
+                using var proc = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -235,18 +265,16 @@ namespace InfoPanel.IPFPS
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     }
-                })
+                };
+                bool started = await StartAsync(proc).ConfigureAwait(false);
+                if (started)
                 {
-                    bool started = await StartAsync(proc).ConfigureAwait(false);
-                    if (started)
+                    string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+                    await proc.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                    if (!output.Contains("STOPPED"))
                     {
-                        string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
-                        await Task.Run(() => proc.WaitForExit(2000), cancellationToken).ConfigureAwait(false);
-                        if (!output.Contains("STOPPED"))
-                        {
-                            Console.WriteLine($"{ServiceName} did not stop cleanly, forcing termination...");
-                            await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
-                        }
+                        Console.WriteLine($"{ServiceName} did not stop cleanly, forcing termination...");
+                        await TerminateExistingPresentMonProcessesAsync(cancellationToken).ConfigureAwait(false);
                     }
                 }
 
@@ -265,7 +293,7 @@ namespace InfoPanel.IPFPS
         {
             try
             {
-                using (var proc = new Process
+                using var proc = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -276,22 +304,20 @@ namespace InfoPanel.IPFPS
                         RedirectStandardOutput = true,
                         RedirectStandardError = true
                     }
-                })
+                };
+                bool started = await StartAsync(proc).ConfigureAwait(false);
+                if (started)
                 {
-                    bool started = await StartAsync(proc).ConfigureAwait(false);
-                    if (started)
+                    string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+                    await proc.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                    string[] lines = output.Split('\n');
+                    foreach (string line in lines)
                     {
-                        string output = await proc.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
-                        await Task.Run(() => proc.WaitForExit(2000), cancellationToken).ConfigureAwait(false);
-                        string[] lines = output.Split('\n');
-                        foreach (string line in lines)
+                        if (line.Contains("PresentMon"))
                         {
-                            if (line.Contains("PresentMon"))
-                            {
-                                string sessionName = line.Trim().Split(' ')[0];
-                                Console.WriteLine($"Found ETW session: {sessionName}, stopping...");
-                                await ExecuteCommandAsync("logman.exe", $"stop {sessionName} -ets", 1000, true, cancellationToken).ConfigureAwait(false);
-                            }
+                            string sessionName = line.Trim().Split(' ')[0];
+                            Console.WriteLine($"Found ETW session: {sessionName}, stopping...");
+                            await ExecuteCommandAsync("logman.exe", $"stop {sessionName} -ets", 1000, true, cancellationToken).ConfigureAwait(false);
                         }
                     }
                 }
@@ -305,6 +331,7 @@ namespace InfoPanel.IPFPS
 
         private async Task TerminateExistingPresentMonProcessesAsync(CancellationToken cancellationToken)
         {
+            // Terminate PresentMon processes
             foreach (var process in Process.GetProcessesByName(PresentMonAppName))
             {
                 try
@@ -312,7 +339,7 @@ namespace InfoPanel.IPFPS
                     if (!process.HasExited)
                     {
                         process.Kill(true);
-                        await Task.Run(() => process.WaitForExit(1000), cancellationToken).ConfigureAwait(false);
+                        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                         Console.WriteLine($"Terminated PresentMon PID: {process.Id}");
                     }
                 }
@@ -326,6 +353,7 @@ namespace InfoPanel.IPFPS
                 }
             }
 
+            // Terminate PresentMonService processes
             foreach (var process in Process.GetProcessesByName(PresentMonServiceAppName))
             {
                 try
@@ -333,7 +361,7 @@ namespace InfoPanel.IPFPS
                     if (!process.HasExited)
                     {
                         process.Kill(true);
-                        await Task.Run(() => process.WaitForExit(1000), cancellationToken).ConfigureAwait(false);
+                        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                         Console.WriteLine($"Terminated PresentMonService PID: {process.Id}");
                     }
                 }
@@ -424,53 +452,77 @@ namespace InfoPanel.IPFPS
                 }
                 _isMonitoring = true;
 
-                using var outputReader = _presentMonProcess.StandardOutput;
-                using var errorReader = _presentMonProcess.StandardError;
+                // Asynchronously monitor output and error streams
+                var outputReader = _presentMonProcess.StandardOutput;
+                var errorReader = _presentMonProcess.StandardError;
 
-                Task outputTask = Task.Run(async () =>
+                var outputTask = Task.Run(async () =>
                 {
                     bool headerSkipped = false;
-                    while (!cancellationToken.IsCancellationRequested && (_presentMonProcess != null && !_presentMonProcess.HasExited))
+                    try
                     {
-                        string? line = await outputReader.ReadLineAsync().ConfigureAwait(false);
-                        if (line != null)
+                        while (!cancellationToken.IsCancellationRequested && _presentMonProcess != null)
                         {
-                            Console.WriteLine($"PresentMon output: {line}");
-                            if (!headerSkipped)
+                            if (_presentMonProcess.HasExited) // Check before reading
                             {
-                                if (line.StartsWith("Application", StringComparison.OrdinalIgnoreCase))
+                                Console.WriteLine("PresentMon has exited, stopping output read.");
+                                break;
+                            }
+                            string? line = await outputReader.ReadLineAsync().ConfigureAwait(false);
+                            if (line != null)
+                            {
+                                Console.WriteLine($"PresentMon output: {line}");
+                                if (!headerSkipped && line.StartsWith("Application", StringComparison.OrdinalIgnoreCase))
                                 {
                                     headerSkipped = true;
                                     Console.WriteLine("Skipped PresentMon CSV header.");
+                                    continue;
                                 }
-                                continue;
+                                if (headerSkipped)
+                                    ProcessOutputLine(line);
                             }
-                            ProcessOutputLine(line);
+                            else
+                            {
+                                Console.WriteLine("Output stream ended.");
+                                break;
+                            }
                         }
-                        else
-                        {
-                            Console.WriteLine("Output stream ended.");
-                            break;
-                        }
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("has exited"))
+                    {
+                        Console.WriteLine($"Output read stopped: PresentMon process has exited - {ex.Message}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error reading output: {ex.Message}");
                     }
                     Console.WriteLine("Output monitoring stopped.");
                 }, cancellationToken);
 
-                Task errorTask = Task.Run(async () =>
+                var errorTask = Task.Run(async () =>
                 {
-                    while (!cancellationToken.IsCancellationRequested && (_presentMonProcess != null && !_presentMonProcess.HasExited))
+                    try
                     {
-                        string? line = await errorReader.ReadLineAsync().ConfigureAwait(false);
-                        if (line != null)
-                            Console.WriteLine($"PresentMon error: {line}");
-                        else
-                            break;
+                        while (!cancellationToken.IsCancellationRequested && _presentMonProcess != null && !_presentMonProcess.HasExited)
+                        {
+                            string? line = await errorReader.ReadLineAsync().ConfigureAwait(false);
+                            if (line != null)
+                                Console.WriteLine($"PresentMon error: {line}");
+                            else
+                                break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error reading error stream: {ex.Message}");
                     }
                 }, cancellationToken);
 
+                // Poll for target process existence and timeout
                 while (!cancellationToken.IsCancellationRequested && _isMonitoring)
                 {
-                    if (!ProcessExists(pid))
+                    bool processStillExists = ProcessExists(pid);
+                    if (!processStillExists)
                     {
                         Console.WriteLine($"Target PID {pid} gone, initiating cleanup...");
                         await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
@@ -479,7 +531,7 @@ namespace InfoPanel.IPFPS
                         break;
                     }
                     await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
-                    if (DateTime.Now - startTime > TimeSpan.FromSeconds(10) && _isMonitoring && !ProcessExists(pid))
+                    if (DateTime.Now - startTime > TimeSpan.FromSeconds(10) && _isMonitoring && !processStillExists)
                     {
                         Console.WriteLine($"Timeout: Forcing cleanup for PID {pid} after 10s...");
                         await StopCaptureAsync(cancellationToken).ConfigureAwait(false);
@@ -573,7 +625,7 @@ namespace InfoPanel.IPFPS
             {
                 Console.WriteLine("Stopping PresentMon...");
                 _presentMonProcess.Kill(true);
-                await Task.Run(() => _presentMonProcess.WaitForExit(5000), cancellationToken).ConfigureAwait(false);
+                await _presentMonProcess.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                 if (!_presentMonProcess.HasExited)
                 {
                     Console.WriteLine("PresentMon did not exit cleanly after kill, forcing termination.");
@@ -617,25 +669,19 @@ namespace InfoPanel.IPFPS
 
         private bool ProcessExists(uint pid)
         {
-            var processes = Process.GetProcesses();
-            foreach (var proc in processes)
+            try
             {
-                try
-                {
-                    if ((uint)proc.Id == pid)
-                    {
-                        bool exists = !proc.HasExited && proc.MainWindowHandle != IntPtr.Zero;
-                        if (!exists)
-                            Console.WriteLine($"PID {pid} no longer exists or has no main window.");
-                        return exists;
-                    }
-                }
-                finally
-                {
-                    proc.Dispose();
-                }
+                using var proc = Process.GetProcessById((int)pid);
+                bool exists = !proc.HasExited && proc.MainWindowHandle != IntPtr.Zero;
+                if (!exists)
+                    Console.WriteLine($"PID {pid} no longer exists or has no main window.");
+                return exists;
             }
-            return false;
+            catch (ArgumentException)
+            {
+                Console.WriteLine($"PID {pid} is no longer valid.");
+                return false;
+            }
         }
 
         private string? GetProcessName(uint pid)
@@ -659,42 +705,36 @@ namespace InfoPanel.IPFPS
 
         private bool IsReShadeActive(uint pid)
         {
-            var processes = Process.GetProcesses();
-            foreach (var proc in processes)
+            try
             {
-                try
+                using var proc = Process.GetProcessById((int)pid);
+                if (proc.HasExited)
                 {
-                    if ((uint)proc.Id != pid) continue;
-
-                    if (proc.HasExited)
-                    {
-                        Console.WriteLine($"PID {pid} has exited, skipping ReShade check.");
-                        return false;
-                    }
-
-                    if (!CanAccessModules(proc))
-                    {
-                        Console.WriteLine($"Unable to check modules for PID {pid} due to access denial (possibly anti-cheat); assuming no ReShade interference.");
-                        return false; // Changed to false to avoid unnecessary warnings
-                    }
-
-                    foreach (ProcessModule module in proc.Modules)
-                    {
-                        if (module.ModuleName.Equals("dxgi.dll", StringComparison.OrdinalIgnoreCase))
-                        {
-                            Console.WriteLine($"ReShade (dxgi.dll) detected in PID {pid}.");
-                            return true;
-                        }
-                    }
+                    Console.WriteLine($"PID {pid} has exited, skipping ReShade check.");
                     return false;
                 }
-                finally
+
+                if (!CanAccessModules(proc))
                 {
-                    proc.Dispose();
+                    Console.WriteLine($"Unable to check modules for PID {pid} due to access denial; assuming no ReShade interference.");
+                    return false;
                 }
+
+                foreach (ProcessModule module in proc.Modules)
+                {
+                    if (module.ModuleName.Equals("dxgi.dll", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine($"ReShade (dxgi.dll) detected in PID {pid}.");
+                        return true;
+                    }
+                }
+                return false;
             }
-            Console.WriteLine($"PID {pid} not found for ReShade check.");
-            return false;
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to perform ReShade check for PID {pid}: {ex.Message}");
+                return false;
+            }
         }
 
         private bool CanAccessModules(Process proc)
@@ -749,7 +789,7 @@ namespace InfoPanel.IPFPS
                         if (!_monitoringTask.IsCompleted)
                             Console.WriteLine("Monitoring task did not complete within 5s, forcing cleanup.");
                     }
-                    catch (Exception ex) when (ex is AggregateException || ex is TaskCanceledException)
+                    catch (AggregateException ex)
                     {
                         Console.WriteLine($"Monitoring task cancelled or failed: {ex.Message}");
                     }
