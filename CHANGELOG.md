@@ -2,6 +2,11 @@
 
 All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
 
+## [1.3.2] - 2025-03-22
+
+### Added
+- New `PluginText` sensor (`windowtitle`) to display the currently captured window title (e.g., "Arma Reforger") or "Nothing to capture" when idle.
+
 ## [1.3.1] - 2025-03-09
 ### Fixed
 - Corrected 1% and 0.1% low FPS calculations in `ProcessOutputLine` to use the worst frames (highest frame times) by sorting frame times in descending order and selecting the appropriate percentiles (99th and 99.9th). Previously, the best frames were incorrectly used, leading to inflated low FPS values (e.g., 176 FPS instead of < average).

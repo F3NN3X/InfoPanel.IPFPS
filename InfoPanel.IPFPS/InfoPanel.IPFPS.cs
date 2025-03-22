@@ -14,9 +14,11 @@ using System.Globalization;
 
 /*
  * Plugin: PresentMon FPS - IPFpsPlugin
- * Version: 1.3.1
+ * Version: 1.3.2
  * Description: A plugin for InfoPanel to monitor and display FPS and frame times of fullscreen/borderless applications using PresentMon.
  * Changelog:
+ *   Version 1.3.2 (2025-03-22)
+ *     - Added new PluginText sensor (`windowtitle`) to display the currently captured window title (e.g., "Arma Reforger") or "Nothing to capture" when idle
  *   Version 1.3.1 (2025-03-09)
  *     - Added 1% low and 0.1% low FPS sensors for performance analysis
  *   Version 1.3.0 (2025-03-09)
@@ -71,6 +73,7 @@ namespace InfoPanel.IPFPS
         private readonly PluginSensor _gpuUtilizationSensor = new("gpu utilization", "GPU Utilization", 0, "%");
         private readonly PluginSensor _onePercentLowSensor = new("1% low", "1% Low FPS", 0, "FPS");
         private readonly PluginSensor _zeroPointOnePercentLowSensor = new("0.1% low", "0.1% Low FPS", 0, "FPS");
+        private readonly PluginText _windowTitle = new("windowtitle", "Currently Capturing", "Nothing to capture"); // Window title sensor
 
         private Process? _presentMonProcess;
         private CancellationTokenSource? _cts;
@@ -110,8 +113,11 @@ namespace InfoPanel.IPFPS
         [DllImport("user32.dll")]
         private static extern bool GetClientRect(HWND hWnd, out Vanara.PInvoke.RECT lpRect);
 
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowText(HWND hWnd, StringBuilder lpString, int nMaxCount);
+
         public IPFpsPlugin()
-            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS, frame times, and GPU/CPU metrics using PresentMon - v1.3.1")
+            : base("fps-plugin", "PresentMon FPS", "Retrieves FPS, frame times, and GPU/CPU metrics using PresentMon - v1.3.2")
         {
             _selfPid = (uint)Process.GetCurrentProcess().Id;
             _presentMonProcess = null;
@@ -479,6 +485,17 @@ namespace InfoPanel.IPFPS
                     Console.WriteLine("PresentMon failed to start.");
                     return;
                 }
+
+                string? windowTitle = GetWindowTitle(pid);
+                if (windowTitle != null)
+                {
+                    _windowTitle.Value = windowTitle;
+                }
+                else
+                {
+                    _windowTitle.Value = $"PID {pid} (Unknown Title)";
+                }
+
                 _isMonitoring = true;
 
                 var outputReader = _presentMonProcess.StandardOutput;
@@ -647,7 +664,6 @@ namespace InfoPanel.IPFPS
                         _zeroPointOnePercentLowSensor.Value = fps;
                     }
 
-                    // Rest of the method (GPU, CPU, etc.) remains unchanged
                     if (float.TryParse(parts[12], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuLatencyMs) &&
                         float.TryParse(parts[13], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuTimeMs) &&
                         float.TryParse(parts[14], NumberStyles.Float, CultureInfo.InvariantCulture, out float gpuBusyMs) &&
@@ -741,6 +757,7 @@ namespace InfoPanel.IPFPS
                 _presentMonProcess = null;
                 _isMonitoring = false;
                 ResetSensors();
+                _windowTitle.Value = "Nothing to capture";
                 Console.WriteLine("Capture cleanup completed.");
             }
 
@@ -777,6 +794,7 @@ namespace InfoPanel.IPFPS
                 _gpuUtilizationSensor.Value = 0;
                 _onePercentLowSensor.Value = 0;
                 _zeroPointOnePercentLowSensor.Value = 0;
+                _windowTitle.Value = "Nothing to capture";
             }
             Console.WriteLine("Sensors reset.");
         }
@@ -813,6 +831,44 @@ namespace InfoPanel.IPFPS
             catch (Exception ex)
             {
                 Console.WriteLine($"Failed to get process name for PID {pid}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private string? GetWindowTitle(uint pid)
+        {
+            try
+            {
+                using Process proc = Process.GetProcessById((int)pid);
+                if (proc.HasExited || proc.MainWindowHandle == IntPtr.Zero)
+                {
+                    Console.WriteLine($"PID {pid} has no main window or has exited.");
+                    return null;
+                }
+
+                const int nChars = 256;
+                StringBuilder title = new(nChars);
+                int length = GetWindowText(proc.MainWindowHandle, title, nChars);
+                if (length > 0)
+                {
+                    string windowTitle = title.ToString();
+                    Console.WriteLine($"Retrieved window title for PID {pid}: {windowTitle}");
+                    return windowTitle;
+                }
+                else
+                {
+                    Console.WriteLine($"No window title found for PID {pid}.");
+                    return proc.ProcessName; // Fallback to process name if title is empty
+                }
+            }
+            catch (ArgumentException)
+            {
+                Console.WriteLine($"PID {pid} is no longer valid for window title check.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to get window title for PID {pid}: {ex.Message}");
                 return null;
             }
         }
@@ -951,6 +1007,7 @@ namespace InfoPanel.IPFPS
             container.Entries.Add(_gpuUtilizationSensor);
             container.Entries.Add(_onePercentLowSensor);
             container.Entries.Add(_zeroPointOnePercentLowSensor);
+            container.Entries.Add(_windowTitle);
             containers.Add(container);
             Console.WriteLine("Sensors loaded into UI.");
         }
