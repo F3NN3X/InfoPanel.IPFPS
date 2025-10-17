@@ -1,4 +1,4 @@
-# PresentMon FPS Plugin for InfoPanel
+# InfoPanel Presentmon Plugin
 
 A plugin for InfoPanel to monitor and display real-time frames per second (FPS) and frame times for fullscreen applications using PresentMon.
 
@@ -13,7 +13,7 @@ A plugin for InfoPanel to monitor and display real-time frames per second (FPS) 
 Follow these steps to get the PresentMon FPS Plugin working with InfoPanel:
 
 1. **Download the Plugin**:
-   - Download the latest release ZIP file (`InfoPanel.IPFPS-vX.X.X.zip`) from the [GitHub Releases page](https://github.com/F3NN3X/InfoPanel.IPFPS/releases).
+   - Download the latest release ZIP file (`InfoPanel.Presentmon-vX.X.X.zip`) from the [GitHub Releases page](https://github.com/F3NN3X/InfoPanel.IPFPS/releases).
 
 2. **Import the Plugin into InfoPanel**:
    - Open the InfoPanel app.
@@ -22,10 +22,10 @@ Follow these steps to get the PresentMon FPS Plugin working with InfoPanel:
    - InfoPanel will extract and install the plugin.
 
 3. **Configure the Plugin**:
-   - On the Plugins page, click **Open Plugins Folder** to locate the plugin files (e.g., `C:\ProgramData\InfoPanel\plugins\InfoPanel.IPFPS\`).
+   - On the Plugins page, click **Open Plugins Folder** to locate the plugin files (e.g., `C:\ProgramData\InfoPanel\plugins\InfoPanel.Presentmon\`).
    - Ensure `PresentMon-2.3.0-x64.exe` and `PresentMonService.exe` are in this folder:
     - Download from [PresentMon releases](https://github.com/GameTechDev/PresentMon/releases) if missing.
-    - Place `PresentMon-2.3.0-x64.exe` and `PresentMonService.exe` in the `PresentMon` subdirectory (e.g., `C:\ProgramData\InfoPanel\plugins\InfoPanel.IPFPS\PresentMon\`).
+    - Place `PresentMon-2.3.0-x64.exe` and `PresentMonService.exe` in the `PresentMon` subdirectory (e.g., `C:\ProgramData\InfoPanel\plugins\InfoPanel.Presentmon\PresentMon\`).
     
 4. **Run InfoPanel**:
    - Launch InfoPanel and activate plugin.

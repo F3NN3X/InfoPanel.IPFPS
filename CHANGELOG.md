@@ -1,6 +1,60 @@
 # Changelog
 
-All notable changes to the **PresentMon FPS Plugin** (`IPFpsPlugin`) are documented here.
+All notable changes to the **InfoPanel Presentmon Plugin** are documented here.
+
+## [2.0.0] - 2025-10-17
+
+### 🎉 Major Release: Complete Architecture Overhaul
+
+This release represents a complete rewrite of the plugin with a modern, maintainable architecture and significantly improved performance.
+
+### Added
+- **Service-Based Architecture**: Introduced proper separation of concerns with dedicated service classes
+  - `PresentMonService`: Handles P/Invoke calls, session management, and frame processing
+  - `FullscreenDetectionService`: Win32 API integration for detecting fullscreen applications
+- **Data Models**: Created structured models for better data management
+  - `FrameMetrics`: Processed performance data with all FPS metrics
+  - `MonitoringState`: Current monitoring status and process information
+  - `FrameProcessingConfig`: Configurable processing parameters
+- **P/Invoke Integration**: Direct native DLL integration with `PresentMonAPI2.dll`
+  - `PresentMonApi`: Centralized P/Invoke declarations with proper error handling
+  - Native `PMFrame` struct processing for optimal performance
+- **Event-Driven Updates**: Real-time sensor updates via service events instead of polling
+- **Background Processing**: Non-blocking frame data processing with async patterns throughout
+
+### Changed
+- **BREAKING**: Project renamed from `InfoPanel.IPFPS` to `InfoPanel.Presentmon` for clarity
+- **BREAKING**: Completely replaced EXE-based PresentMon integration with direct DLL calls
+- **Performance**: Eliminated process spawning, CSV parsing, and inter-process communication overhead
+- **Architecture**: Migrated from single 1100+ line monolith to clean service-based architecture
+- **Data Flow**: Switched from polling-based updates to event-driven real-time updates
+- **Resource Management**: Improved memory efficiency with direct native frame data access
+- **Error Handling**: Enhanced error handling with proper P/Invoke result codes (`PM_RESULT`)
+
+### Removed
+- **EXE Dependencies**: No longer requires `PresentMon-2.3.0-x64.exe` or `PresentMonService.exe`
+- **Windows Service Management**: Eliminated complex service creation/management code
+- **CSV Processing**: Removed string parsing overhead in favor of native struct processing
+- **Process Management**: Removed complex process orchestration and cleanup logic
+
+### Fixed
+- **Reliability**: Eliminated process-related crashes and hanging issues
+- **Performance**: Reduced CPU overhead and memory usage significantly
+- **Maintainability**: Clear separation of concerns makes debugging and testing easier
+- **Thread Safety**: Proper async/await patterns throughout with cancellation support
+
+### Technical Details
+- **Framework**: Targets .NET 8.0-windows with x64 architecture
+- **Dependencies**: Only requires `PresentMonAPI2.dll` (bundled) and `Vanara.PInvoke.*` packages
+- **Compatibility**: Maintains identical sensor interface for seamless InfoPanel integration
+- **Build Output**: Simplified to `InfoPanel.Presentmon-v2.0.0.zip` with clean folder structure
+
+### Migration Notes
+- Users upgrading from v1.x will need to replace the entire plugin folder
+- All existing functionality is preserved but with significantly improved performance
+- Configuration and sensor names remain unchanged for compatibility
+
+---
 
 ## [1.3.2] - 2025-03-22
 

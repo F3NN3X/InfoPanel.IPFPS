@@ -1,0 +1,121 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>x64</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Ensure all referenced assemblies are copied to the output directory -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Disable generation of deps.json -->
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <!-- Disable generation of PDB files in Release builds -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <!-- Limit satellite resources to English only -->
+    <SatelliteResourceLanguages>en-US</SatelliteResourceLanguages>
+    <!-- Define the plugin version -->
+    <Version>2.0.0</Version>
+    <!-- Customize output path for Release builds -->
+    <OutputPath Condition="'$(Configuration)' == 'Release'">bin\Release\net8.0-windows\InfoPanel.Presentmon-v$(Version)\InfoPanel.Presentmon</OutputPath>
+    <!-- Prevent appending TargetFramework to OutputPath -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Prevent creation of subdirectories in the output -->
+    <UseAppHost>false</UseAppHost>
+    <!-- Don't create platform-specific subfolders -->
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <!-- Disable runtime config generation -->
+    <GenerateRuntimeConfigurationFiles>false</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+  <!-- Post-build event commands -->
+  <Target Name="MoveDependencyFiles" AfterTargets="Build">
+    <ItemGroup>
+      <SubdirDLLs Include="$(OutputPath)**\*.dll" Exclude="$(OutputPath)*.dll" />
+      <SubdirPDBs Include="$(OutputPath)**\*.pdb" Exclude="$(OutputPath)*.pdb" />
+    </ItemGroup>
+    
+    <Copy SourceFiles="@(SubdirDLLs)" DestinationFolder="$(OutputPath)" />
+    <Copy SourceFiles="@(SubdirPDBs)" DestinationFolder="$(OutputPath)" />
+    
+    <!-- Clean up unnecessary directories and files -->
+    <ItemGroup>
+      <DirectoriesToDelete Include="$(OutputPath)runtimes" />
+      <DirectoriesToDelete Include="$(OutputPath)net8.0-windows" />
+      <DirectoriesToDelete Include="$(OutputPath)amd64" />
+      <DirectoriesToDelete Include="$(OutputPath)arm64" />
+      <DirectoriesToDelete Include="$(OutputPath)x86" />
+      <FilesToDelete Include="$(OutputPath)*.pdb" Condition="'$(Configuration)' == 'Release'" />
+      <FilesToDelete Include="$(OutputPath)*.xml" />
+      <FilesToDelete Include="$(OutputPath)*.json" />
+      <FilesToDelete Include="$(OutputPath)System.CodeDom.dll" />
+    </ItemGroup>
+    
+    <RemoveDir Directories="@(DirectoriesToDelete)" />
+    <Delete Files="@(FilesToDelete)" ContinueOnError="true" />
+  </Target>
+
+  <!-- ZIP packaging for release builds -->
+  <Target Name="CreateReleaseZip" AfterTargets="MoveDependencyFiles" Condition="'$(Configuration)' == 'Release'">
+    <PropertyGroup>
+      <ZipFileName>InfoPanel.Presentmon-v$(Version).zip</ZipFileName> <!-- Thanks MermenJazz for reminding me to fix this 🫡 -->
+      <ZipOutputPath>$(OutputPath)..\..\$(ZipFileName)</ZipOutputPath>
+      <PluginFolderName>InfoPanel.Presentmon</PluginFolderName>
+      <TempZipDir>$(OutputPath)..\temp_zip</TempZipDir>
+    </PropertyGroup>
+    
+    <Message Text="Creating release ZIP: $(ZipOutputPath)" Importance="high" />
+    
+    <!-- Remove existing ZIP and temp directory if they exist -->
+    <Delete Files="$(ZipOutputPath)" ContinueOnError="true" />
+    <RemoveDir Directories="$(TempZipDir)" ContinueOnError="true" />
+    
+    <!-- Create temp directory structure -->
+    <MakeDir Directories="$(TempZipDir)\$(PluginFolderName)" />
+    
+    <!-- Copy plugin files to temp directory -->
+    <ItemGroup>
+      <PluginFiles Include="$(OutputPath)**\*.*" />
+    </ItemGroup>
+    
+    <Copy SourceFiles="@(PluginFiles)" 
+          DestinationFiles="@(PluginFiles->'$(TempZipDir)\$(PluginFolderName)\%(RecursiveDir)%(Filename)%(Extension)')" />
+    
+    <!-- Create the ZIP file -->
+    <ZipDirectory 
+      SourceDirectory="$(TempZipDir)" 
+      DestinationFile="$(ZipOutputPath)" 
+      Overwrite="true" />
+    
+    <!-- Clean up temp directory -->
+    <RemoveDir Directories="$(TempZipDir)" />
+    
+    <Message Text="Release ZIP created successfully: $(ZipOutputPath)" Importance="high" />
+  </Target>
+
+  <ItemGroup>
+    <PackageReference Include="Vanara.PInvoke.DwmApi" Version="4.0.6" />
+    <PackageReference Include="Vanara.PInvoke.Kernel32" Version="4.0.5" />
+    <PackageReference Include="Vanara.PInvoke.User32" Version="4.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="E:\GitHub\PublicRepos\infopanel\InfoPanel.Plugins\InfoPanel.Plugins.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copy PresentMonAPI2.dll directly to output directory -->
+    <None Update="PresentMonAPI2.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>PresentMonAPI2.dll</TargetPath>
+    </None>
+    <None Update="PluginInfo.ini">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>PluginInfo.ini</TargetPath>
+    </None>
+  </ItemGroup>
+
+</Project>
