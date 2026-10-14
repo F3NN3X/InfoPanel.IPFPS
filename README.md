@@ -82,6 +82,13 @@ If the plugin isn’t working as expected, check the InfoPanel logs or UI for cl
 ### **Still Stuck?**
 If issues persist, check Task Manager for lingering `PresentMon-2.3.0-x64.exe` or `PresentMonService.exe` processes—kill them manually. Open a GitHub Issue with your logs (e.g., last 20 lines after closing the app) and steps tried.
 
+## Releasing
+
+1. Bump `<Version>` in `InfoPanel.Presentmon/InfoPanel.Presentmon.csproj` and `Version` in `PluginInfo.ini`, and add a `CHANGELOG.md` entry for the new version.
+2. Commit, then push a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The `Release Build` workflow builds the plugin, checks the tag matches the csproj version, and publishes the zip as a GitHub release. The plugin API comes from the committed `Libs/InfoPanel.Plugins.dll`, so no local InfoPanel checkout is needed.
+
 ## Contributing
 
 Found a bug or have a feature idea? Open an [issue](https://github.com/F3NN3X/InfoPanel.IPFPS/issues) or submit a [pull request](https://github.com/F3NN3X/InfoPanel.IPFPS/pulls) on the repository!
